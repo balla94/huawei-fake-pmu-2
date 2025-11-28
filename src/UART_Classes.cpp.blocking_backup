@@ -1,0 +1,156 @@
+#include "UART_Classes.h"
+
+// ============================================================================
+// DebugUART Implementation
+// ============================================================================
+
+void DebugUART::begin(uint32_t baud) {
+    PORTB.DIRSET = PIN2_bm;
+    PORTB.DIRCLR = PIN3_bm;
+
+    uint32_t desired_baud = baud;
+    uint32_t baud_value = (20000000UL * 64UL + (desired_baud * 16UL) / 2) / (desired_baud * 16UL);
+    USART0.BAUD = baud_value;
+
+    USART0.CTRLC = USART_CMODE_ASYNCHRONOUS_gc |
+                  USART_PMODE_DISABLED_gc |
+                  USART_SBMODE_1BIT_gc |
+                  USART_CHSIZE_8BIT_gc;
+
+    USART0.CTRLB = USART_RXEN_bm | USART_TXEN_bm;
+    delay(1);
+}
+
+void DebugUART::write(uint8_t data) {
+    while (!(USART0.STATUS & USART_DREIF_bm)) {}
+    USART0.TXDATAL = data;
+}
+
+void DebugUART::print(const char* str) {
+    while (*str) write(*str++);
+}
+
+void DebugUART::print(uint16_t num) {
+    char buffer[6];
+    itoa(num, buffer, 10);
+    print(buffer);
+}
+
+void DebugUART::printHex(uint16_t num) {
+    char buffer[6];
+    sprintf(buffer, "0x%03X", num);
+    print(buffer);
+}
+
+void DebugUART::println(const char* str) {
+    print(str); write('\r'); write('\n');
+}
+
+void DebugUART::println() {
+    write('\r'); write('\n');
+}
+
+uint8_t DebugUART::available() {
+    return (USART0.STATUS & USART_RXCIF_bm);
+}
+
+uint8_t DebugUART::read() {
+    return USART0.RXDATAL;
+}
+
+// ============================================================================
+// NineBitUART Implementation
+// ============================================================================
+
+void NineBitUART::begin(uint32_t baud) {
+    PORTA.DIRSET = PIN1_bm;
+    PORTA.DIRCLR = PIN2_bm;
+
+    uint32_t baud_value = 8333;
+    USART1.BAUD = baud_value;
+
+    USART1.CTRLC = USART_CMODE_ASYNCHRONOUS_gc |
+                  USART_PMODE_DISABLED_gc |
+                  USART_SBMODE_1BIT_gc |
+                  USART_CHSIZE_9BITL_gc;
+
+    USART1.CTRLB = USART_RXEN_bm | USART_TXEN_bm;
+
+    clearBuffer();
+    delay(1);
+}
+
+void NineBitUART::write9(uint16_t data) {
+    // WARNING: This function blocks until transmission completes (~1ms at 9600 baud)
+    digitalWrite(RS485_DE, HIGH);
+
+    while (!(USART1.STATUS & USART_DREIF_bm)) {}  // Block until TX buffer ready
+    USART1.TXDATAL = data & 0xFF;
+    USART1.TXDATAH = (data >> 8) & 0x01;
+
+    while (!(USART1.STATUS & USART_TXCIF_bm)) {}  // Block until transmission complete
+    USART1.STATUS |= USART_TXCIF_bm;
+
+    // Small delay to ensure last bit is fully transmitted on RS485 bus
+    delayMicroseconds(100);  // ~1 bit time at 9600 baud
+    digitalWrite(RS485_DE, LOW);
+}
+
+uint8_t NineBitUART::available() {
+    return (USART1.STATUS & USART_RXCIF_bm);
+}
+
+uint16_t NineBitUART::read9() {
+    // Reading RXDATAL automatically snapshots RXDATAH, so this is atomic by hardware design
+    uint8_t low_byte = USART1.RXDATAL;
+    uint8_t high_byte = USART1.RXDATAH;
+
+    // Check for framing error (bit 2 of RXDATAH in 9-bit mode)
+    if (high_byte & USART_FERR_bm) {
+        // Framing error detected - return error value
+        return 0xFFFF;  // Same as timeout error
+    }
+
+    return low_byte | ((high_byte & 0x01) << 8);
+}
+
+uint16_t NineBitUART::read9WithTimeout() {
+    // WARNING: This function blocks for up to 5ms!
+    // TODO: Consider implementing non-blocking alternative using state machine
+    uint32_t start = micros();
+    while (!available()) {
+        if (micros() - start > (RESPONSE_TIMEOUT * 1000)) return 0xFFFF;
+        asm("nop");  // Busy-wait - blocks main loop!
+    }
+    return read9();
+}
+
+void NineBitUART::clearBuffer() {
+    // Clear any buffer overflow flag first
+    if (USART1.RXDATAH & USART_BUFOVF_bm) {
+        USART1.RXDATAH &= ~USART_BUFOVF_bm;  // Clear overflow flag
+    }
+
+    // Read and discard all pending bytes from RX buffer
+    while (USART1.STATUS & USART_RXCIF_bm) {
+        (void)USART1.RXDATAL;  // Reading RXDATAL clears RXCIF
+        (void)USART1.RXDATAH;
+    }
+}
+
+void NineBitUART::waitForBusIdle(uint8_t ms) {
+    uint32_t start = millis();
+    while (millis() - start < ms) {
+        if (available()) {
+            read9();
+            start = millis();
+        }
+    }
+}
+
+// ============================================================================
+// Global Instance Definitions
+// ============================================================================
+
+DebugUART Debug;
+NineBitUART UART9;

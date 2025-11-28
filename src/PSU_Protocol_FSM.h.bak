@@ -1,0 +1,245 @@
+#ifndef PSU_PROTOCOL_FSM_H
+#define PSU_PROTOCOL_FSM_H
+
+#include <Arduino.h>
+#include "UART_Classes.h"
+
+// =============================================================================
+// PSU Protocol Constants
+// =============================================================================
+
+#define PSU_COUNT 10                    // Maximum number of PSUs supported (addresses 0-9)
+#define PSU_BASE_ADDRESS 0x120          // Base address for PSU discovery
+#define PSU_ACK 0x07F                   // Acknowledgment byte from PSU
+#define INIT_COMMAND 0x1C0              // Command to start PSU initialization
+#define CMD_BYTE 0xC8                   // Command byte in packet structure
+#define INIT_MAGIC_BYTE 0x01            // Magic byte for initialization command
+#define PSU_NO_DATA 0x073               // Response when PSU has no data (initialized state)
+#define RESPONSE_TIMEOUT 50           // Timeout for individual byte reads (ms)
+#define STATE_TIMEOUT 50              // Timeout for state machine states (ms)
+
+// Magic bytes for different PSU operations
+#define MAGIC_VOLTAGE_CURRENT 0x024     // Query voltage and current
+#define MAGIC_EXTENDED_STATUS 0x023     // AC Power Status packet (NOT busy!)
+#define MAGIC_SET_VOLTAGE_CURRENT 0x042 // Set voltage and current
+
+// =============================================================================
+// Protocol State Definitions
+// =============================================================================
+
+enum class PSUState {
+    IDLE,                               // No active operation
+    DISCOVER_WAIT_RESPONSE,             // Waiting for response to discovery packet
+    DISCOVER_PROCESS_RESPONSE,          // Processing discovery response
+    AUTO_INIT_SEND_ACK,                 // Send ACK for auto-initialization
+    AUTO_INIT_SEND_ADDRESS_CMD,         // Send address command for auto-init
+    AUTO_INIT_WAIT_ADDRESS_RESPONSE,    // Wait for address response in auto-init
+    AUTO_INIT_SEND_COMMAND_PACKET,      // Send command packet for auto-init
+    AUTO_INIT_WAIT_COMMAND_ACK,         // Wait for command ACK in auto-init
+    AUTO_INIT_SEND_FINAL_ADDRESS,       // Send final address in auto-init
+    AUTO_INIT_WAIT_FINAL_RESPONSE,      // Wait for final response in auto-init
+    AUTO_INIT_HANDLE_AC_POWER_STATUS,   // Handle AC power status during init
+    QUERY_SEND_ADDRESS_CMD,             // Send address command for query
+    QUERY_WAIT_ADDRESS_RESPONSE,        // Wait for address response in query
+    QUERY_SEND_COMMAND_PACKET,          // Send query command packet
+    QUERY_WAIT_COMMAND_ACK,             // Wait for command ACK in query
+    QUERY_SEND_FINAL_ADDRESS,           // Send final address in query
+    QUERY_WAIT_DATA_PACKET,             // Wait for data packet response
+    QUERY_PROCESS_DATA_PACKET,          // Process received data packet
+    QUERY_HANDLE_AC_POWER_STATUS,       // Handle AC power status during query
+    QUERY_SEND_FINAL_ACK,               // Send final ACK after data received
+    SET_SEND_ADDRESS_CMD,               // Send address command for set operation
+    SET_WAIT_ADDRESS_RESPONSE,          // Wait for address response in set
+    SET_SEND_COMMAND_PACKET,            // Send set command packet
+    SET_WAIT_COMMAND_ACK,               // Wait for command ACK in set
+    SET_SEND_FINAL_ADDRESS,             // Send final address in set
+    SET_WAIT_DATA_PACKET,               // Wait for set confirmation packet
+    SET_PROCESS_DATA_PACKET,            // Process set confirmation
+    SET_HANDLE_AC_POWER_STATUS,         // Handle AC power status during set
+    SET_SEND_FINAL_ACK,                 // Send final ACK after set
+    COMPLETE_SUCCESS,                   // Operation completed successfully
+    COMPLETE_ERROR,                     // Operation failed with error
+    TIMEOUT_ERROR                       // Operation timed out
+};
+
+// PSU command types
+enum class PSUCommand {
+    DISCOVER,                           // Discover PSU presence
+    INITIALIZE,                         // Initialize PSU
+    QUERY_VOLTAGE_CURRENT,              // Query voltage and current readings
+    SET_VOLTAGE_CURRENT,                // Set voltage and current limits
+    QUERY_EXTENDED_STATUS               // Query extended status information
+};
+
+// AC Power Status
+enum class ACStatus {
+    UNKNOWN,
+    POWER_GOOD,
+    POWER_LOST
+};
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+/**
+ * @brief Measurement data from PSU
+ */
+struct PSUMeasurement {
+    float voltage = 0.0;                // Voltage reading in volts
+    float current = 0.0;                // Current reading in amps
+    bool success = false;               // Whether measurement was successful
+};
+
+/**
+ * @brief PSU packet structure for received data
+ */
+struct PSUPacket {
+    uint8_t address;                    // PSU address
+    uint8_t zeroByte;                   // Should always be 0x00
+    uint8_t dataLength;                 // Length of data section
+    uint8_t commandByte;                // Should be 0xC8
+    uint8_t magicByte;                  // Magic byte identifying packet type
+    uint8_t* data;                      // Packet data payload
+    uint8_t crc;                        // CRC checksum
+    bool valid;                         // Whether packet passed validation
+
+    PSUPacket() : address(0), zeroByte(0), dataLength(0), commandByte(0),
+                 magicByte(0), data(nullptr), crc(0), valid(false) {}
+};
+
+/**
+ * @brief AC Power Status information
+ */
+struct ACStatusInfo {
+    ACStatus status = ACStatus::UNKNOWN;
+    bool valid = false;
+    uint8_t rawData[17]; // Store the full AC status data for analysis
+};
+
+/**
+ * @brief Transaction tracking for state machine
+ */
+struct PSUTransaction {
+    PSUState state = PSUState::IDLE;    // Current state of the transaction
+    PSUCommand command = PSUCommand::DISCOVER; // Type of command being executed
+    uint8_t psuAddress = 0;             // PSU address (0-9)
+    uint8_t magicByte = 0;              // Magic byte for the command
+    const uint8_t* txData = nullptr;    // Transmission data buffer
+    uint8_t txDataLength = 0;           // Length of transmission data
+    void* result = nullptr;             // Pointer to result storage
+    uint32_t stateStartTime = 0;        // Timestamp when state started
+    bool success = false;               // Whether transaction succeeded
+    uint8_t initRetryCount = 0;
+    ACStatusInfo acStatus;              // AC power status information
+};
+
+// =============================================================================
+// PSU Protocol Finite State Machine Class
+// =============================================================================
+
+/**
+ * @brief Finite State Machine for PSU communication protocol
+ *
+ * Handles discovery, initialization, and monitoring of PSUs in a hot-swappable
+ * rack environment. Automatically detects PSU insertion/removal and maintains
+ * communication state.
+ */
+class PSUProtocolFSM {
+private:
+    // =========================================================================
+    // Internal State Variables
+    // =========================================================================
+    PSUTransaction currentTransaction;          // Current active transaction
+    bool psuInitialized[PSU_COUNT];   // Track initialization state per PSU
+    bool psuPresent[PSU_COUNT];       // Track presence state per PSU
+    ACStatus psuACStatus[PSU_COUNT]; // AC power status per PSU
+    uint32_t psuLastSeen[PSU_COUNT];      // Last response timestamp per PSU
+    uint8_t currentDiscoveryAddress;        // Current address being discovered
+    uint32_t lastDiscoveryTime;             // Last discovery cycle time
+    uint32_t discoveryInterval;          // Interval between discovery attempts (ms)
+    uint32_t disappearanceTimeout;       // Time before considering PSU gone (ms)
+
+    // PSU Data Caching (for menu display)
+    float psuLastVoltage[PSU_COUNT];        // Last known voltage reading (V)
+    float psuLastCurrent[PSU_COUNT];        // Last known current reading (A)
+    uint32_t psuLastQueryTime[PSU_COUNT];   // Timestamp of last successful query
+    bool psuDataValid[PSU_COUNT];           // Whether cached data is valid
+
+    // Protocol timing adjustments (optimized for reliable communication)
+    uint8_t ack_delay;                      // Delay after ACK (ms)
+    uint8_t command_delay;                  // Delay after command (ms)
+    uint8_t inter_byte_delay;             // Delay between packet bytes (µs)
+    uint8_t discover_delay;                 // Delay after discovery packet (ms)
+
+    // =========================================================================
+    // Private Methods
+    // =========================================================================
+
+    void sendCommandPacket(uint8_t psuAddress, uint8_t magicByte, const uint8_t* data, uint8_t dataLength);
+    PSUPacket receiveAndValidatePacket(uint8_t expectedAddress = 0xFF, uint8_t expectedMagic = 0xFF);
+    ACStatusInfo processACStatusPacket(const PSUPacket& packet);
+    void freePacket(PSUPacket& packet);
+    bool handleVoltageCurrentPacket(const PSUPacket& packet, void* result);
+    void quietPrint(const char* str);
+    void quietPrintln(const char* str);
+    void quietPrintHex(uint16_t num);
+    void quietPrintNum(uint8_t num);
+    void checkPSUDisappearance();
+    void updateDiscovery();
+    PSUState handleACPowerStatus(const PSUPacket& packet);
+
+public:
+    // =========================================================================
+    // Public Interface
+    // =========================================================================
+
+    void begin();
+    void update();
+
+    // =========================================================================
+    // Timing Configuration Methods
+    // =========================================================================
+
+    void setAckDelay(uint8_t ms);
+    void setCommandDelay(uint8_t ms);
+    void setInterByteDelay(uint16_t us);
+    void setDiscoverDelay(uint8_t ms);
+    void setDiscoveryInterval(uint32_t ms);
+    void setDisappearanceTimeout(uint32_t ms);
+
+    // =========================================================================
+    // Status Query Methods
+    // =========================================================================
+
+    bool isPSUInitialized(uint8_t psuAddress);
+    bool isPSUPresent(uint8_t psuAddress);
+    ACStatus getPSUACStatus(uint8_t psuAddress);
+    bool hasACPower(uint8_t psuAddress);
+    uint8_t getPSUCount();
+    uint8_t getInitializedPSUCount();
+
+    // =========================================================================
+    // Data Caching Methods (for menu display)
+    // =========================================================================
+
+    float getLastVoltage(uint8_t psuAddress);
+    float getLastCurrent(uint8_t psuAddress);
+    bool isDataValid(uint8_t psuAddress);
+    uint32_t getLastQueryTime(uint8_t psuAddress);
+
+    // =========================================================================
+    // Public Query Methods
+    // =========================================================================
+
+    bool startVoltageCurrentQuery(uint8_t psuAddress, PSUMeasurement* result = nullptr);
+    bool startVoltageCurrentSet(uint8_t psuAddress, float voltage, float current, PSUMeasurement* result = nullptr);
+    bool startACStatusQuery(uint8_t psuAddress, ACStatusInfo* result = nullptr);
+    bool isBusy() const;
+    bool transactionSuccess() const;
+};
+
+// Global FSM instance
+extern PSUProtocolFSM PSUController;
+
+#endif

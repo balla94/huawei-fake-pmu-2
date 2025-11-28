@@ -1,0 +1,45 @@
+#ifndef UART_CLASSES_H
+#define UART_CLASSES_H
+
+#include <Arduino.h>
+
+#define RS485_DE PIN_PA4
+#define RESPONSE_TIMEOUT 5
+
+/**
+ * @brief Debug UART interface using USART0
+ * Provides serial communication for debugging at 115200 baud
+ */
+class DebugUART {
+public:
+    void begin(uint32_t baud = 115200);
+    void write(uint8_t data);
+    void print(const char* str);
+    void print(uint16_t num);
+    void printHex(uint16_t num);
+    void println(const char* str);
+    void println();
+    uint8_t available();
+    uint8_t read();
+};
+
+/**
+ * @brief 9-bit UART interface using USART1
+ * Provides RS485 communication with 9-bit addressing mode
+ */
+class NineBitUART {
+public:
+    void begin(uint32_t baud = 9600);
+    void write9(uint16_t data);
+    uint8_t available();
+    uint16_t read9();
+    uint16_t read9WithTimeout();
+    void clearBuffer();
+    void waitForBusIdle(uint8_t ms);
+};
+
+// Global instances
+extern DebugUART Debug;
+extern NineBitUART UART9;
+
+#endif
