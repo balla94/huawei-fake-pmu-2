@@ -69,7 +69,7 @@ void rs485Begin(uint32_t baud) {
                    USART_SBMODE_1BIT_gc | USART_CHSIZE_9BITL_gc;
 
     // Enable RS485 mode with hardware XDIR control on PA4
-    USART1.CTRLA = USART_RS485_EXT_gc;
+    USART1.CTRLA = USART_RS485_ENABLE_gc;
 
     USART1.CTRLB = USART_RXEN_bm | USART_TXEN_bm;
     delay(1);
