@@ -57,14 +57,19 @@ void debugPrintln(const char* str) {
 // =============================================================================
 
 void rs485Begin(uint32_t baud) {
-    PORTA.DIRSET = PIN1_bm;
+    // TX and XDIR as output, RX as input
+    PORTA.DIRSET = PIN1_bm | PIN4_bm;
     PORTA.DIRCLR = PIN2_bm;
 
     uint32_t baud_value = (F_CPU * 64UL + (baud * 8UL)) / (baud * 16UL);
     USART1.BAUD = baud_value;
 
+    // 9-bit mode for space parity (9th bit always 0), 1 stop bit
     USART1.CTRLC = USART_CMODE_ASYNCHRONOUS_gc | USART_PMODE_DISABLED_gc |
-                   USART_SBMODE_1BIT_gc | USART_CHSIZE_8BIT_gc;
+                   USART_SBMODE_1BIT_gc | USART_CHSIZE_9BITL_gc;
+
+    // Enable RS485 mode with hardware XDIR control on PA4
+    USART1.CTRLA = USART_RS485_EXT_gc;
 
     USART1.CTRLB = USART_RXEN_bm | USART_TXEN_bm;
     delay(1);
@@ -72,25 +77,21 @@ void rs485Begin(uint32_t baud) {
 
 void rs485Write(uint8_t data) {
     while (!(USART1.STATUS & USART_DREIF_bm)) {}
+    // 9th bit = 0 (space parity)
+    USART1.TXDATAH = 0;
     USART1.TXDATAL = data;
 }
 
 void rs485Println(const char* str) {
-    digitalWrite(RS485_DE, HIGH);
-    delayMicroseconds(10);
-
     while (*str) {
         rs485Write(*str++);
     }
     rs485Write('\r');
     rs485Write('\n');
 
-    // Wait for transmission complete
+    // Wait for transmission complete (XDIR handled by hardware)
     while (!(USART1.STATUS & USART_TXCIF_bm)) {}
     USART1.STATUS |= USART_TXCIF_bm;
-
-    delayMicroseconds(100);
-    digitalWrite(RS485_DE, LOW);
 }
 
 // =============================================================================
@@ -114,9 +115,7 @@ void setup() {
     // Initialize debug UART
     debugBegin(115200);
 
-    // Initialize RS485
-    pinMode(RS485_DE, OUTPUT);
-    digitalWrite(RS485_DE, LOW);
+    // Initialize RS485 (XDIR on PA4 controlled by hardware)
     rs485Begin(9600);
 
     // Initialize LCD
