@@ -80,10 +80,4 @@
 #define DISCOVERY_INTERVAL_MS 3000
 #define BUTTON_DEBOUNCE_MS   50
 
-// UART buffer sizes (must be power of 2)
-#define RX_BUFFER_SIZE  64
-#define TX_BUFFER_SIZE  64
-#define RX_BUFFER_MASK  (RX_BUFFER_SIZE - 1)
-#define TX_BUFFER_MASK  (TX_BUFFER_SIZE - 1)
-
 #endif // PINOUT_H
