@@ -227,17 +227,18 @@ void setup() {
 
 void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
 {
+        char debugMsg[80];  // Buffer for formatted strings
+
+    sprintf(debugMsg, "Length: %d, buffer[3]: 0x%02X, buffer[4]: 0x%02X", 
+            length, buffer[3], buffer[4]);
+    debugPrintln(debugMsg);
+
+
     if(length < 5)return;
     if(buffer[3] != 0xC8)
     {
         debugPrintln("Magic error");
     }
-
-    char debugMsg[80];  // Buffer for formatted strings
-
-    sprintf(debugMsg, "Length: %d, buffer[3]: 0x%02X, buffer[4]: 0x%02X", 
-            length, buffer[3], buffer[4]);
-    debugPrintln(debugMsg);
 
 
     switch(buffer[4])
