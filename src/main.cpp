@@ -244,7 +244,7 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
         case MAGIC_PSU_INIT:
             psu[psu_id].busAction = ACTION_PSU_INIT;
             debugPrintln("PSU Init");
-        break;
+            break;
 
         case MAGIC_PSU_POLL_OUTPUT:
             psu[psu_id].actVoltage = (buffer[8] << 8) | buffer[9];
@@ -263,8 +263,7 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
             uint16_t power = (psu[psu_id].actVoltage / 100) * (psu[psu_id].actCurrent / 100);
             sprintf(debugMsg, "Output Power: ~%d W", power);
             debugPrintln(debugMsg);
-
-        break;
+            break;
 
         case MAGIC_PSU_POLL_SERIAL:
             psu[psu_id].deviceInfo = "";
@@ -278,10 +277,9 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
             }
             sprintf(debugMsg, "Device Info: %s", psu[psu_id].deviceInfo.c_str());
             debugPrintln(debugMsg);
-        break;
+            break;
         
         case MAGIC_PSU_SET_VOLTAGE:
-
              if(buffer[7] == 0x00)
                 {
                     psu[psu_id].setVoltageError = true;
@@ -291,8 +289,7 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                     psu[psu_id].setVoltageError = false;
                     debugPrintln("VSET OK");
                 }
-        
-        break;
+            break;
         
         case MAGIC_PSU_POLL_AC_STATUS: 
                 if(buffer[10] == 0x00)
@@ -306,7 +303,7 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                     debugPrintln("AC LOST");
                 }
             
-        break;
+            break;
 
         case MAGIC_PSU_SET_OUTPUT: 
 
@@ -378,10 +375,7 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                 sprintf(debugMsg, "    Output Temperature: %d C", 
                         psu[psu_id].outputTemperature);
                 debugPrintln(debugMsg);
-                
-
-        
-        break;
+            break;
 
          default:
             sprintf(debugMsg, ">>> UNKNOWN Magic: 0x%02X", buffer[4]);
