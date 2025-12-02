@@ -235,6 +235,10 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
 
     char debugMsg[80];  // Buffer for formatted strings
 
+    sprintf(debugMsg, "Length: %d, buffer[3]: 0x%02X, buffer[4]: 0x%02X", 
+            length, buffer[3], buffer[4]);
+    debugPrintln(debugMsg);
+
 
     switch(buffer[4])
     {
@@ -278,8 +282,7 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
         break;
         
         case MAGIC_PSU_SET_VOLTAGE:
-        if(length>=8)
-        {
+
              if(buffer[7] == 0x00)
                 {
                     psu[psu_id].setVoltageError = true;
@@ -289,12 +292,10 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                     psu[psu_id].setVoltageError = false;
                     debugPrintln("VSET OK");
                 }
-        }
+        
         break;
         
         case MAGIC_PSU_POLL_AC_STATUS: 
-            if(length>11)
-            {
                 if(buffer[10] == 0x00)
                 {
                     psu[psu_id].acPresent = true;
@@ -305,12 +306,11 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                     psu[psu_id].acPresent = false;
                     debugPrintln("AC LOST");
                 }
-            }
+            
         break;
 
         case MAGIC_PSU_SET_OUTPUT: 
-            if(length>=8)
-            {
+
                 if(buffer[7] == 0xAA)
                 {
                     psu[psu_id].isOutputEnable = true;
@@ -321,12 +321,11 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                     psu[psu_id].isOutputEnable = false;
                     debugPrintln("OUT OFF");
                 }
-            }
+            
         break;
 
         case MAGIC_PSU_POLL_AC_PARAMETERS:
-        if(length>=27)
-        {
+
             psu[psu_id].inputVoltage = (buffer[8] << 8) | buffer[9];
             psu[psu_id].inputCurrent = (buffer[10] << 8) | buffer[11];
             psu[psu_id].inputFreq = (buffer[12] << 8) | buffer[13];
@@ -382,7 +381,7 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                 debugPrintln(debugMsg);
                 
 
-        }
+        
         break;
 
          default:
