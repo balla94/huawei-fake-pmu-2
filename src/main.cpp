@@ -98,7 +98,13 @@ enum BusStates {
 BusStates busState = BUS_IDLE;
 
 enum busActions { 
-    ACTION_PSU_INIT
+    ACTION_PSU_INIT,
+    ACTION_GET_PSU_SERIAL,
+    ACTION_GET_AC_PARAMETERS,
+    ACTION_GET_OUTPUT_PARAMETERS,
+    ACTION_GET_AC_STATUS,
+    ACTION_SET_OUTPUT_ENABLED,
+    ACTION_SET_OUTPUT_PARAMETERS
  }; 
 
 
@@ -108,6 +114,19 @@ struct PSU {
   uint16_t setCurrent;
   uint16_t actVoltage;
   uint16_t actCurrent;
+  bool setOutputEnable;
+  bool isOutputEnable;
+  String deviceInfo;
+  uint16_t inputVoltage;
+  uint16_t inputCurrent;
+  uint16_t inputFreq;
+  uint16_t inputPowerVA;
+  uint16_t inputPowerW;
+  uint16_t inputPowerFactor;
+  uint16_t inputTemperature;
+  uint16_t outputTemperature;
+  bool acPresent;
+  bool setVoltageError;
   busActions busAction;
 };
 
@@ -150,6 +169,9 @@ void reset_psu_struct()
     for (int i = 0; i < 10; i++) {
     psu[i].online = false;
     psu[i].busAction = ACTION_PSU_INIT;
+    psu[i].setVoltage = 3800;
+    psu[i].setCurrent = 100;
+    psu[i].setOutputEnable = false;
   }
 }
 
@@ -210,11 +232,170 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
     {
         debugPrintln("Magic error");
     }
+
+    char debugMsg[80];  // Buffer for formatted strings
+
+
     switch(buffer[4])
     {
-        case 0x01:
+        case MAGIC_PSU_INIT:
             psu[psu_id].busAction = ACTION_PSU_INIT;
+            debugPrintln("PSU Init");
         break;
+
+        case MAGIC_PSU_POLL_OUTPUT:
+            psu[psu_id].actVoltage = (buffer[8] << 8) | buffer[9];
+            psu[psu_id].actCurrent = (buffer[10] << 8) | buffer[11];
+
+            sprintf(debugMsg, "Output Voltage: %d.%02d V", 
+                        psu[psu_id].actVoltage / 100, 
+                        psu[psu_id].actVoltage % 100);
+            debugPrintln(debugMsg);
+                
+            sprintf(debugMsg, "Output Current: %d.%02d A", 
+                        psu[psu_id].actCurrent / 100, 
+                        psu[psu_id].actCurrent % 100);
+            debugPrintln(debugMsg);
+                
+            uint16_t power = (psu[psu_id].actVoltage / 100) * (psu[psu_id].actCurrent / 100);
+            sprintf(debugMsg, "Output Power: ~%d W", power);
+            debugPrintln(debugMsg);
+
+        break;
+
+        case MAGIC_PSU_POLL_SERIAL:
+            psu[psu_id].deviceInfo = "";
+            for(int i = 5; i < length - 1; i++)
+            {
+                if(buffer[i] != 0x00 && buffer[i] != 0xFF)
+                {
+                    if(buffer[i] == '\n' || buffer[i] == '\r')psu[psu_id].deviceInfo.concat(' ');
+                    else psu[psu_id].deviceInfo.concat((char)buffer[i]);
+                }
+            }
+            sprintf(debugMsg, "Device Info: %s", psu[psu_id].deviceInfo.c_str());
+            debugPrintln(debugMsg);
+        break;
+        
+        case MAGIC_PSU_SET_VOLTAGE:
+        if(length>=8)
+        {
+             if(buffer[7] == 0x00)
+                {
+                    psu[psu_id].setVoltageError = true;
+                    debugPrintln("VSET error");
+                }
+                else {
+                    psu[psu_id].setVoltageError = false;
+                    debugPrintln("VSET OK");
+                }
+        }
+        break;
+        
+        case MAGIC_PSU_POLL_AC_STATUS: 
+            if(length>11)
+            {
+                if(buffer[10] == 0x00)
+                {
+                    psu[psu_id].acPresent = true;
+                    debugPrintln("AC OK");
+                }
+                else
+                {
+                    psu[psu_id].acPresent = false;
+                    debugPrintln("AC LOST");
+                }
+            }
+        break;
+
+        case MAGIC_PSU_SET_OUTPUT: 
+            if(length>=8)
+            {
+                if(buffer[7] == 0xAA)
+                {
+                    psu[psu_id].isOutputEnable = true;
+                    debugPrintln("OUT ON");
+                }
+                else
+                {
+                    psu[psu_id].isOutputEnable = false;
+                    debugPrintln("OUT OFF");
+                }
+            }
+        break;
+
+        case MAGIC_PSU_POLL_AC_PARAMETERS:
+        if(length>=27)
+        {
+            psu[psu_id].inputVoltage = (buffer[8] << 8) | buffer[9];
+            psu[psu_id].inputCurrent = (buffer[10] << 8) | buffer[11];
+            psu[psu_id].inputFreq = (buffer[12] << 8) | buffer[13];
+            psu[psu_id].inputPowerVA = (buffer[16] << 8) | buffer[17];
+            psu[psu_id].inputPowerW = (buffer[20] << 8) | buffer[21];
+            psu[psu_id].inputPowerFactor = (buffer[22] << 8) | buffer[23];
+            psu[psu_id].inputTemperature = (buffer[24] << 8) | buffer[25];
+            psu[psu_id].outputTemperature = (buffer[26] << 8) | buffer[27]; 
+
+             psu[psu_id].inputVoltage = (buffer[8] << 8) | buffer[9];
+                psu[psu_id].inputCurrent = (buffer[10] << 8) | buffer[11];
+                psu[psu_id].inputFreq = (buffer[12] << 8) | buffer[13];
+                psu[psu_id].inputPowerVA = (buffer[16] << 8) | buffer[17];
+                psu[psu_id].inputPowerW = (buffer[20] << 8) | buffer[21];
+                psu[psu_id].inputPowerFactor = (buffer[22] << 8) | buffer[23];
+                psu[psu_id].inputTemperature = (buffer[24] << 8) | buffer[25];
+                psu[psu_id].outputTemperature = (buffer[26] << 8) | buffer[27];
+                
+                sprintf(debugMsg, "    Input Voltage: %d.%01d V", 
+                        psu[psu_id].inputVoltage / 10, 
+                        psu[psu_id].inputVoltage % 10);
+                debugPrintln(debugMsg);
+                
+                sprintf(debugMsg, "    Input Current: %d.%02d A", 
+                        psu[psu_id].inputCurrent / 100, 
+                        psu[psu_id].inputCurrent % 100);
+                debugPrintln(debugMsg);
+                
+                sprintf(debugMsg, "    Input Frequency: %d.%01d Hz", 
+                        psu[psu_id].inputFreq / 10, 
+                        psu[psu_id].inputFreq % 10);
+                debugPrintln(debugMsg);
+                
+                sprintf(debugMsg, "    Input Power (VA): %d VA", 
+                        psu[psu_id].inputPowerVA);
+                debugPrintln(debugMsg);
+                
+                sprintf(debugMsg, "    Input Power (W): %d W", 
+                        psu[psu_id].inputPowerW);
+                debugPrintln(debugMsg);
+                
+                sprintf(debugMsg, "    Power Factor: %d.%03d", 
+                        psu[psu_id].inputPowerFactor / 1000, 
+                        psu[psu_id].inputPowerFactor % 1000);
+                debugPrintln(debugMsg);
+                
+                sprintf(debugMsg, "    Input Temperature: %d C", 
+                        psu[psu_id].inputTemperature);
+                debugPrintln(debugMsg);
+                
+                sprintf(debugMsg, "    Output Temperature: %d C", 
+                        psu[psu_id].outputTemperature);
+                debugPrintln(debugMsg);
+                
+
+        }
+        break;
+
+         default:
+            sprintf(debugMsg, ">>> UNKNOWN Magic: 0x%02X", buffer[4]);
+            debugPrintln(debugMsg);
+            debugPrint("    Raw data: ");
+            for(int i = 0; i < length; i++) {
+                sprintf(debugMsg, "%02X ", buffer[i]);
+                debugPrint(debugMsg);
+            }
+            debugPrintln("");
+            break;
+
     }
 
 }
@@ -358,11 +539,80 @@ void psu_loop()
             switch(psu[psu_id].busAction)
             {
                 case ACTION_PSU_INIT:
-                    forgePacket(0x01, 2, 0xFF, 0xFF);
-                    for(int i = 0; i < bus_tx_length; i++) {
+                    forgePacket(MAGIC_PSU_INIT, 2, 0xFF, 0xFF);
+                    for(int i = 0; i < bus_tx_length; i++)
+                    {
                     UART9.write9(bus_tx[i]);  // Use write() for data bytes, not write9()
-            }
+                    }
+                    psu[psu_id].busAction = ACTION_GET_PSU_SERIAL;
                 break;
+
+                case ACTION_GET_PSU_SERIAL:
+                    forgePacket(MAGIC_PSU_POLL_SERIAL, 2, 0xFF, 0xFF);
+                    for(int i = 0; i < bus_tx_length; i++)
+                    {
+                    UART9.write9(bus_tx[i]);  // Use write() for data bytes, not write9()
+                    }
+                    psu[psu_id].busAction = ACTION_GET_AC_PARAMETERS;
+                break;
+
+                case ACTION_GET_AC_PARAMETERS:
+                    forgePacket(MAGIC_PSU_POLL_AC_PARAMETERS, 2, 0xFF, 0xFF);
+                    for(int i = 0; i < bus_tx_length; i++)
+                    {
+                    UART9.write9(bus_tx[i]);  // Use write() for data bytes, not write9()
+                    }
+                    psu[psu_id].busAction = ACTION_GET_OUTPUT_PARAMETERS;
+                break;
+
+                case ACTION_GET_OUTPUT_PARAMETERS:
+                    forgePacket(MAGIC_PSU_POLL_OUTPUT, 2, 0xFF, 0xFF);
+                    for(int i = 0; i < bus_tx_length; i++)
+                    {
+                    UART9.write9(bus_tx[i]);  // Use write() for data bytes, not write9()
+                    }
+                    psu[psu_id].busAction = ACTION_GET_AC_STATUS;
+                break;
+
+                case ACTION_GET_AC_STATUS:
+                    forgePacket(MAGIC_PSU_POLL_AC_STATUS, 2, 0xFF, 0xFF);
+                    for(int i = 0; i < bus_tx_length; i++)
+                    {
+                    UART9.write9(bus_tx[i]);  // Use write() for data bytes, not write9()
+                    }
+                    psu[psu_id].busAction = ACTION_SET_OUTPUT_ENABLED;
+                break;
+
+                case ACTION_SET_OUTPUT_ENABLED:
+                    forgePacket(
+                        MAGIC_PSU_SET_VOLTAGE,
+                         4, 0xFF, 0xFF,
+                         psu[psu_id].setOutputEnable ? 0x00 : 0x01, 0x00);
+
+                    for(int i = 0; i < bus_tx_length; i++)
+                    {
+                    UART9.write9(bus_tx[i]);  // Use write() for data bytes, not write9()
+                    }
+                    psu[psu_id].busAction = ACTION_SET_OUTPUT_PARAMETERS;
+                break;
+
+                case ACTION_SET_OUTPUT_PARAMETERS:
+
+                    forgePacket(
+                        MAGIC_PSU_SET_VOLTAGE,
+                         6, 0xFF, 0xFF,
+                         (psu[psu_id].setVoltage >> 8) & 0xFF, psu[psu_id].setVoltage & 0xFF,
+                         (psu[psu_id].setCurrent >> 8) & 0xFF, psu[psu_id].setCurrent & 0xFF
+                        );
+
+                    for(int i = 0; i < bus_tx_length; i++)
+                    {
+                    UART9.write9(bus_tx[i]);  // Use write() for data bytes, not write9()
+                    }
+                    psu[psu_id].busAction = ACTION_GET_AC_PARAMETERS;
+                break;
+
+
             }
             timer = millis();
             busState = WRITE_CYCLE_WAIT_FOR_PSU_ACK;
