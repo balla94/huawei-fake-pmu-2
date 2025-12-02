@@ -233,8 +233,6 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
             length, buffer[3], buffer[4]);
     debugPrintln(debugMsg);
 
-
-    if(length < 5)return;
     if(buffer[3] != 0xC8)
     {
         debugPrintln("Magic error");
@@ -585,7 +583,7 @@ void psu_loop()
 
                 case ACTION_SET_OUTPUT_ENABLED:
                     forgePacket(
-                        MAGIC_PSU_SET_VOLTAGE,
+                        MAGIC_PSU_SET_OUTPUT,
                          4, 0xFF, 0xFF,
                          psu[psu_id].setOutputEnable ? 0x00 : 0x01, 0x00);
 
