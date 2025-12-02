@@ -169,9 +169,9 @@ void reset_psu_struct()
     for (int i = 0; i < 10; i++) {
     psu[i].online = false;
     psu[i].busAction = ACTION_PSU_INIT;
-    psu[i].setVoltage = 3800;
+    psu[i].setVoltage = 4500;
     psu[i].setCurrent = 100;
-    psu[i].setOutputEnable = false;
+    psu[i].setOutputEnable = true;
   }
 }
 
@@ -242,11 +242,15 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
     switch(buffer[4])
     {
         case MAGIC_PSU_INIT:
+        {
             psu[psu_id].busAction = ACTION_PSU_INIT;
             debugPrintln("PSU Init");
             break;
+        }
+
 
         case MAGIC_PSU_POLL_OUTPUT:
+        {
             psu[psu_id].actVoltage = (buffer[8] << 8) | buffer[9];
             psu[psu_id].actCurrent = (buffer[10] << 8) | buffer[11];
 
@@ -264,8 +268,10 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
             sprintf(debugMsg, "Output Power: ~%d W", power);
             debugPrintln(debugMsg);
             break;
+        }
 
         case MAGIC_PSU_POLL_SERIAL:
+        {
             psu[psu_id].deviceInfo = "";
             for(int i = 5; i < length - 1; i++)
             {
@@ -278,9 +284,12 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
             sprintf(debugMsg, "Device Info: %s", psu[psu_id].deviceInfo.c_str());
             debugPrintln(debugMsg);
             break;
+        }
+
         
         case MAGIC_PSU_SET_VOLTAGE:
-             if(buffer[7] == 0x00)
+        {
+            if(buffer[7] == 0x00)
                 {
                     psu[psu_id].setVoltageError = true;
                     debugPrintln("VSET error");
@@ -290,9 +299,12 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                     debugPrintln("VSET OK");
                 }
             break;
+        }
+
         
         case MAGIC_PSU_POLL_AC_STATUS: 
-                if(buffer[10] == 0x00)
+        {
+            if(buffer[10] == 0x00)
                 {
                     psu[psu_id].acPresent = true;
                     debugPrintln("AC OK");
@@ -304,10 +316,12 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                 }
             
             break;
+        }
+
 
         case MAGIC_PSU_SET_OUTPUT: 
-
-                if(buffer[7] == 0xAA)
+        {
+            if(buffer[7] == 0xAA)
                 {
                     psu[psu_id].isOutputEnable = true;
                     debugPrintln("OUT ON");
@@ -318,9 +332,13 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                     debugPrintln("OUT OFF");
                 }
             
-        break;
+            break;
+        }
+                
 
         case MAGIC_PSU_POLL_AC_PARAMETERS:
+        {
+
 
             psu[psu_id].inputVoltage = (buffer[8] << 8) | buffer[9];
             psu[psu_id].inputCurrent = (buffer[10] << 8) | buffer[11];
@@ -376,6 +394,7 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
                         psu[psu_id].outputTemperature);
                 debugPrintln(debugMsg);
             break;
+                }
 
          default:
             sprintf(debugMsg, ">>> UNKNOWN Magic: 0x%02X", buffer[4]);
