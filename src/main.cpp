@@ -321,15 +321,19 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
 
         case MAGIC_PSU_SET_OUTPUT: 
         {
-            if(buffer[7] == 0xAA)
+            if(buffer[7] == 0x55)
                 {
                     psu[psu_id].isOutputEnable = true;
                     debugPrintln("OUT ON");
                 }
+                else if(buffer[7] == 0xAA)
+                {
+                    psu[psu_id].isOutputEnable = true;
+                    debugPrintln("OUT OFF");
+                }
                 else
                 {
-                    psu[psu_id].isOutputEnable = false;
-                    debugPrintln("OUT OFF");
+                    debugPrintln("OUT Unknown");
                 }
             
             break;
