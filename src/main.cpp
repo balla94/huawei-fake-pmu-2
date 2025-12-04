@@ -430,19 +430,30 @@ void psu_loop()
             }
         break;
 
-        case READ_CYCLE_SEND_REQUEST:
-            if(psu[psu_id].online == false && psu[psu_id].offline_ignored_poll_cycles < PSU_IGNORE_OFFLINE_CYCLES)
-            {
-                psu[psu_id].offline_ignored_poll_cycles = psu[psu_id].offline_ignored_poll_cycles + 1;
-                psu_id = psu_id + 1;
-                if(psu_id >=10)psu_id = 0;
-                break;
-            }
-            UART9.write9(PSU_READ_REQUEST + psu_id);
-            timer = millis();
-            busState = READ_CYCLE_READ_DATA;
-            reset_bus_rx_buffer();
+case READ_CYCLE_SEND_REQUEST:
+    // Skip offline PSUs for PSU_IGNORE_OFFLINE_CYCLES cycles
+    if(psu[psu_id].online == false && psu[psu_id].offline_ignored_poll_cycles < PSU_IGNORE_OFFLINE_CYCLES)
+    {
+        psu[psu_id].offline_ignored_poll_cycles = psu[psu_id].offline_ignored_poll_cycles + 1;
+        psu_id = psu_id + 1;
+        if(psu_id >= 10) psu_id = 0;
+        busState = BUS_IDLE;  // Go back to idle to restart the cycle
+        timer = millis();
         break;
+    }
+    
+    // If offline counter reached limit, reset it to try polling again
+    if(psu[psu_id].online == false && psu[psu_id].offline_ignored_poll_cycles >= PSU_IGNORE_OFFLINE_CYCLES)
+    {
+        psu[psu_id].offline_ignored_poll_cycles = 0;
+    }
+    
+    UART9.write9(PSU_READ_REQUEST + psu_id);
+    timer = millis();
+    busState = READ_CYCLE_READ_DATA;
+    reset_bus_rx_buffer();
+break;
+
 
         case READ_CYCLE_READ_DATA:
             // If no response, then mark PSU offline and timeout
@@ -460,6 +471,7 @@ void psu_loop()
                 timer = millis();
                 bus_rx[bus_rx_length] = (uint8_t)(UART9.read9() & 0xFF);
                 bus_rx_length = bus_rx_length + 1;
+                psu[psu_id].offline_ignored_poll_cycles = 0;
             }
             // If we got a 'nothing to say' byte, just mark the PSU online and continue writing
             if(bus_rx_length == 1 && bus_rx[0] == PSU_NO_DATA_ACK)
