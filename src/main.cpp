@@ -629,29 +629,34 @@ void psu_loop()
             busState = WRITE_CYCLE_WAIT_FOR_PSU_ACK;
         break;
         
-        case WRITE_CYCLE_WAIT_FOR_PSU_ACK:
-         if(millis() - timer > PSU_ANSWER_TIMEOUT)
+       case WRITE_CYCLE_WAIT_FOR_PSU_ACK:
+    if(millis() - timer > PSU_ANSWER_TIMEOUT)
+    {
+        timer = millis();
+        psu[psu_id].online = false;
+        psu_id = psu_id + 1;
+        busState = BUS_IDLE;
+    }
+    else if(UART9.available() > 0)
+    {
+        uint8_t rx = (uint8_t)(UART9.read9() & 0xFF);
+        if(rx == PSU_ACK)
+        {
+            debugPrintln("Got ACK");
+            
+            // Only move to next PSU when we've completed the full cycle
+            // (when we're back at ACTION_GET_AC_PARAMETERS, which means
+            // we just finished ACTION_SET_OUTPUT_PARAMETERS)
+            if(psu[psu_id].busAction == ACTION_GET_AC_PARAMETERS)
             {
-                timer = millis();
-                psu[psu_id].online = false;
                 psu_id = psu_id + 1;
-                busState = BUS_IDLE;
-                timer = millis();
             }
-            if(UART9.available()>0)
-            {
-                uint8_t rx = (uint8_t)(UART9.read9() & 0xFF);
-                if(rx == PSU_ACK)
-                {
-                    debugPrintln("Got ACK");
-                    busState = BUS_IDLE;
-                }
-                timer = millis();
-                if(psu[psu_id].busAction = ACTION_GET_AC_PARAMETERS)psu_id = psu_id + 1;
-                busState = BUS_IDLE;
-                timer = millis();
-            }
-        break;
+            
+            busState = BUS_IDLE;
+            timer = millis();
+        }
+    }
+    break;
     }
 }
 
