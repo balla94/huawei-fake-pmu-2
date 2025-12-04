@@ -437,8 +437,6 @@ case READ_CYCLE_SEND_REQUEST:
         psu[psu_id].offline_ignored_poll_cycles = psu[psu_id].offline_ignored_poll_cycles + 1;
         psu_id = psu_id + 1;
         if(psu_id >= 10) psu_id = 0;
-        busState = BUS_IDLE;  // Go back to idle to restart the cycle
-        timer = millis();
         break;
     }
     
