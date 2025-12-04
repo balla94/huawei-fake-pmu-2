@@ -647,7 +647,7 @@ void psu_loop()
                     busState = BUS_IDLE;
                 }
                 timer = millis();
-                psu_id = psu_id + 1;
+                if(psu[psu_id].busAction = ACTION_GET_AC_PARAMETERS)psu_id = psu_id + 1;
                 busState = BUS_IDLE;
                 timer = millis();
             }

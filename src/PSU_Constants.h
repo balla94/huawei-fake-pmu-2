@@ -4,7 +4,7 @@
 #define PSU_READY_TO_RECEIVE 0x000
 #define PSU_NO_DATA_ACK 0x073
 
-#define BUS_IDLE_TIMER (uint32_t)500 //milliseconds
+#define BUS_IDLE_TIMER (uint32_t)200 //milliseconds
 #define PSU_ANSWER_TIMEOUT (uint32_t)30 //milliseconds
 
 #define PMU_ANSWER_DELAY (uint32_t)3
