@@ -110,6 +110,7 @@ enum busActions {
 
 struct PSU {
   bool online;
+  uint8_t offline_ignored_poll_cycles;
   uint16_t setVoltage;
   uint16_t setCurrent;
   uint16_t actVoltage;
@@ -172,6 +173,7 @@ void reset_psu_struct()
     psu[i].setVoltage = 4500;
     psu[i].setCurrent = 100;
     psu[i].setOutputEnable = true;
+    psu[i].offline_ignored_poll_cycles = 0;
   }
 }
 
@@ -429,6 +431,13 @@ void psu_loop()
         break;
 
         case READ_CYCLE_SEND_REQUEST:
+            if(psu[psu_id].online == false && psu[psu_id].offline_ignored_poll_cycles < PSU_IGNORE_OFFLINE_CYCLES)
+            {
+                psu[psu_id].offline_ignored_poll_cycles = psu[psu_id].offline_ignored_poll_cycles + 1;
+                psu_id = psu_id + 1;
+                if(psu_id >=10)psu_id = 0;
+                break;
+            }
             UART9.write9(PSU_READ_REQUEST + psu_id);
             timer = millis();
             busState = READ_CYCLE_READ_DATA;

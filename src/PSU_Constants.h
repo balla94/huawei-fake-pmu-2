@@ -4,8 +4,8 @@
 #define PSU_READY_TO_RECEIVE 0x000
 #define PSU_NO_DATA_ACK 0x073
 
-#define BUS_IDLE_TIMER (uint32_t)200 //milliseconds
-#define PSU_ANSWER_TIMEOUT (uint32_t)30 //milliseconds
+#define BUS_IDLE_TIMER (uint32_t)50 //milliseconds
+#define PSU_ANSWER_TIMEOUT (uint32_t)10 //milliseconds
 
 #define PMU_ANSWER_DELAY (uint32_t)3
 
@@ -19,3 +19,4 @@
 #define MAGIC_PSU_POLL_OUTPUT (uint8_t)0x24
 #define MAGIC_PSU_POLL_AC_PARAMETERS (uint8_t)0x46
 
+#define PSU_IGNORE_OFFLINE_CYCLES (uint8_t)10
