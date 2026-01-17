@@ -133,6 +133,10 @@ struct PSU {
 
 PSU psu[10];
 
+
+
+ uint8_t rotary_test;
+
 void forgePacket(uint8_t magic, uint8_t payloadLength, ...) {
     bus_tx_length = 0;
     
@@ -170,9 +174,9 @@ void reset_psu_struct()
     for (int i = 0; i < 10; i++) {
     psu[i].online = false;
     psu[i].busAction = ACTION_PSU_INIT;
-    psu[i].setVoltage = 4500;
+    psu[i].setVoltage = 5200;
     psu[i].setCurrent = 100;
-    psu[i].setOutputEnable = true;
+    psu[i].setOutputEnable = false;
     psu[i].offline_ignored_poll_cycles = 0;
   }
 }
@@ -195,17 +199,19 @@ uint8_t calculateCRC(const uint8_t* buffer, uint8_t length) {
 void setup() {
     delay(100);
 
-    // Initialize debug UART
-    debugBegin(115200);
-    UART9.begin(9600);
 
-    // Initialize LCD
     lcd.init();
     Wire.setClock(I2C_FREQ);
     lcd.backlight();
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("Hello World");
+    lcd.print("Initializing");
+
+    // Initialize debug UART
+    debugBegin(115200);
+    UART9.begin(9600);
+
+
 
     // Initialize rotary encoder
     encoder = new RotaryEncoder(ENCODER_DT, ENCODER_CLK, RotaryEncoder::LatchMode::FOUR3);
@@ -417,6 +423,18 @@ void processAnswer(uint8_t psu_id,const uint8_t* buffer, uint8_t length)
 
 }
 
+void printOfflineReason(const char* string)
+{
+    debugPrintln(string);
+    if(psu[psu_id].online  == true)
+    {
+            lcd.clear();
+            lcd.setCursor(0,0);
+            lcd.print(string);
+            rotary_test++;
+    }
+}
+
 void psu_loop()
 {
     if(psu_id >=10)psu_id = 0;
@@ -445,7 +463,10 @@ case READ_CYCLE_SEND_REQUEST:
     {
         psu[psu_id].offline_ignored_poll_cycles = 0;
     }
-    
+
+    // Flush any stale data from UART buffer before sending request
+    while(UART9.available()) UART9.read9();
+
     UART9.write9(PSU_READ_REQUEST + psu_id);
     timer = millis();
     busState = READ_CYCLE_READ_DATA;
@@ -454,15 +475,6 @@ break;
 
 
         case READ_CYCLE_READ_DATA:
-            // If no response, then mark PSU offline and timeout
-            if(millis() - timer > PSU_ANSWER_TIMEOUT)
-            {
-                timer = millis();
-                psu[psu_id].online = false;
-                psu_id = psu_id + 1;
-                busState = BUS_IDLE;
-                 debugPrint("answerTimeout");
-            }
             // If UART buffer has data, read it to buffer and reset the timer
             if(UART9.available()>0)
             {
@@ -470,6 +482,17 @@ break;
                 bus_rx[bus_rx_length] = (uint8_t)(UART9.read9() & 0xFF);
                 bus_rx_length = bus_rx_length + 1;
                 psu[psu_id].offline_ignored_poll_cycles = 0;
+            }
+            // If no response, then mark PSU offline and timeout
+            else if(millis() - timer > PSU_ANSWER_TIMEOUT)
+            {
+                timer = millis();
+                printOfflineReason("READ_ANSWER");
+                psu[psu_id].online = false;
+                psu_id = psu_id + 1;
+                busState = BUS_IDLE;
+                debugPrint("answerTimeout");
+                break;
             }
             // If we got a 'nothing to say' byte, just mark the PSU online and continue writing
             if(bus_rx_length == 1 && bus_rx[0] == PSU_NO_DATA_ACK)
@@ -486,6 +509,7 @@ break;
                 if(calculateCRC(bus_rx,bus_rx_length) == bus_rx[bus_rx_length -1 ])
                 {
                     debugPrint("CRC OK");
+                    psu[psu_id].online = true;
                     processAnswer(psu_id,bus_rx,bus_rx_length);
                     busState = READ_CYCLE_WAIT_FOR_SEND_ACK;
                     timer = millis();
@@ -498,6 +522,7 @@ break;
                         bus_rx_length,calculateCRC(bus_rx,bus_rx_length), bus_rx[bus_rx_length -1 ]);
                     debugPrint(out);
                     timer = millis();
+                    printOfflineReason("CRC");
                     psu[psu_id].online = false;
                     psu_id = psu_id + 1;
                     busState = BUS_IDLE;
@@ -529,26 +554,22 @@ break;
         break;
 
         case WRITE_CYCLE_SEND_REQUEST:
+            // Flush any stale data from UART buffer before sending request
+            while(UART9.available()) UART9.read9();
+
             UART9.write9(PSU_WRITE_REQUEST + psu_id);
             timer = millis();
             busState = WRITE_CYCLE_WAIT_CLEAR_TO_SEND;
         break;
         
-        case WRITE_CYCLE_WAIT_CLEAR_TO_SEND: 
-            if(millis() - timer > PSU_ANSWER_TIMEOUT)
-            {
-                timer = millis();
-                psu[psu_id].online = false;
-                psu_id = psu_id + 1;
-                busState = BUS_IDLE;
-                timer = millis();
-            }
+        case WRITE_CYCLE_WAIT_CLEAR_TO_SEND:
             if(UART9.available()>0)
             {
                 uint8_t rx = (uint8_t)(UART9.read9() & 0xFF);
                 if(rx == psu_id)
                 {
                     debugPrintln("Got CTS");
+                    timer = millis();
                     busState = WRITE_CYCLE_WAIT_AFTER_CLEAR_TO_SEND;
                 }
                 else
@@ -558,6 +579,14 @@ break;
                     busState = BUS_IDLE;
                     timer = millis();
                 }
+            }
+            else if(millis() - timer > PSU_ANSWER_TIMEOUT)
+            {
+                timer = millis();
+                printOfflineReason("WRITE_CTS");
+                psu[psu_id].online = false;
+                psu_id = psu_id + 1;
+                busState = BUS_IDLE;
             }
         break;
         
@@ -656,6 +685,7 @@ break;
     if(millis() - timer > PSU_ANSWER_TIMEOUT)
     {
         timer = millis();
+        printOfflineReason("WRITE_ACK");
         psu[psu_id].online = false;
         psu_id = psu_id + 1;
         busState = BUS_IDLE;
@@ -666,7 +696,8 @@ break;
         if(rx == PSU_ACK)
         {
             debugPrintln("Got ACK");
-            
+            psu[psu_id].online = true;
+
             // Only move to next PSU when we've completed the full cycle
             // (when we're back at ACTION_GET_AC_PARAMETERS, which means
             // we just finished ACTION_SET_OUTPUT_PARAMETERS)
@@ -683,17 +714,209 @@ break;
     }
 }
 
+enum lcdLoopStates {
+    LCD_STATE_FORMAT_ROTARY,
+    LCD_STATE_FORMAT_ACTIVE_PSUS,
+    LCD_STATE_FORMAT_VOLTAGE,
+    LCD_STATE_FORMAT_TEMP,
+    LCD_STATE_SNAKE_CHECK,
+    LCD_STATE_SNAKE_WRITE_ROW,
+    LCD_STATE_SETCURSOR_LINE_1,
+    LCD_STATE_WRITE_LINE_1,
+    LCD_STATE_SETCURSOR_LINE_2,
+    LCD_STATE_WRITE_LINE_2
+ };
+
+// Snake animation - border positions clockwise, 5 pixel snake
+// Border: 5x8 char, perimeter = 5+7+4+6 = 22 pixels (corners shared)
+// Path clockwise starting top-left:
+// Pos 0-4:   top row    (row 0, cols 0->4)
+// Pos 5-11:  right col  (col 4, rows 1->7)
+// Pos 12-15: bottom row (row 7, cols 3->0) - col 4 already counted
+// Pos 16-21: left col   (col 0, rows 6->1) - row 7 and row 0 already counted
+
+// Bit positions: col0=0b10000, col1=0b01000, col2=0b00100, col3=0b00010, col4=0b00001
+const uint8_t snakeFrames[22][8] PROGMEM = {
+    // Frame 0: snake at positions 0,21,20,19,18 (top-left corner + left col)
+    {0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b00000, 0b00000, 0b00000},
+    // Frame 1: positions 1,0,21,20,19
+    {0b11000, 0b10000, 0b10000, 0b10000, 0b00000, 0b00000, 0b00000, 0b00000},
+    // Frame 2: positions 2,1,0,21,20
+    {0b11100, 0b10000, 0b10000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000},
+    // Frame 3: positions 3,2,1,0,21
+    {0b11110, 0b10000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000},
+    // Frame 4: positions 4,3,2,1,0 (full top row)
+    {0b11111, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000},
+    // Frame 5: positions 5,4,3,2,1 (turning top-right corner)
+    {0b01111, 0b00001, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000},
+    // Frame 6: positions 6,5,4,3,2
+    {0b00111, 0b00001, 0b00001, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000},
+    // Frame 7: positions 7,6,5,4,3
+    {0b00011, 0b00001, 0b00001, 0b00001, 0b00000, 0b00000, 0b00000, 0b00000},
+    // Frame 8: positions 8,7,6,5,4
+    {0b00001, 0b00001, 0b00001, 0b00001, 0b00001, 0b00000, 0b00000, 0b00000},
+    // Frame 9: positions 9,8,7,6,5
+    {0b00000, 0b00001, 0b00001, 0b00001, 0b00001, 0b00001, 0b00000, 0b00000},
+    // Frame 10: positions 10,9,8,7,6
+    {0b00000, 0b00000, 0b00001, 0b00001, 0b00001, 0b00001, 0b00001, 0b00000},
+    // Frame 11: positions 11,10,9,8,7 (bottom-right corner, row 7 col 4)
+    {0b00000, 0b00000, 0b00000, 0b00001, 0b00001, 0b00001, 0b00001, 0b00001},
+    // Frame 12: positions 12,11,10,9,8 (bottom row col3)
+    {0b00000, 0b00000, 0b00000, 0b00000, 0b00001, 0b00001, 0b00001, 0b00011},
+    // Frame 13: positions 13,12,11,10,9 (bottom row col2)
+    {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00001, 0b00001, 0b00111},
+    // Frame 14: positions 14,13,12,11,10 (bottom row col1)
+    {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00001, 0b01111},
+    // Frame 15: positions 15,14,13,12,11 (bottom row col0 = bottom-left corner)
+    {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111},
+    // Frame 16: positions 16,15,14,13,12 (left col row6 + bottom row)
+    // pos16=row6col0, pos15=row7col0, pos14=row7col1, pos13=row7col2, pos12=row7col3
+    // row6: 0b10000, row7: 0b10000+0b01000+0b00100+0b00010 = 0b11110
+    {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b10000, 0b11110},
+    // Frame 17: positions 17,16,15,14,13
+    // pos17=row5col0, pos16=row6col0, pos15=row7col0, pos14=row7col1, pos13=row7col2
+    // row5: 0b10000, row6: 0b10000, row7: 0b10000+0b01000+0b00100 = 0b11100
+    {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b10000, 0b10000, 0b11100},
+    // Frame 18: positions 18,17,16,15,14
+    // pos18=row4col0, pos17=row5col0, pos16=row6col0, pos15=row7col0, pos14=row7col1
+    // row4-6: 0b10000 each, row7: 0b10000+0b01000 = 0b11000
+    {0b00000, 0b00000, 0b00000, 0b00000, 0b10000, 0b10000, 0b10000, 0b11000},
+    // Frame 19: positions 19,18,17,16,15
+    // pos19=row3col0, pos18=row4col0, pos17=row5col0, pos16=row6col0, pos15=row7col0
+    {0b00000, 0b00000, 0b00000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000},
+    // Frame 20: positions 20,19,18,17,16
+    // pos20=row2col0, pos19=row3col0, pos18=row4col0, pos17=row5col0, pos16=row6col0
+    {0b00000, 0b00000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b00000},
+    // Frame 21: positions 21,20,19,18,17
+    // pos21=row1col0, pos20=row2col0, pos19=row3col0, pos18=row4col0, pos17=row5col0
+    {0b00000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b00000, 0b00000}
+};
+
+uint8_t snakeFrame = 0;
+uint8_t snakeRowIndex = 0;
+uint8_t snakeCharData[8];
+uint32_t lastSnakeUpdate = 0; 
+
+ lcdLoopStates lcdLoopState;
+
+
+void lcd_loop()
+{
+    static char lcdLines[2][17] = {"                ", "                "};  // 16 chars + null
+    static uint8_t lcdCharIndex = 0;
+    static uint32_t lastLcdUpdate = 0;
+    static uint16_t maxInputVoltage = 0;
+    static uint16_t maxOutputTemp = 0;
+    static char activePsus = '0';
+
+    if(busState != BUS_IDLE && busState != READ_CYCLE_BUS_IDLE_AFTER_ACK && busState != READ_CYCLE_WAIT_FOR_SEND_ACK  ) return;
+    lastLcdUpdate = millis();
+
+    switch(lcdLoopState)
+    {
+        case LCD_STATE_FORMAT_ROTARY:
+            sprintf(lcdLines[0], "%3d             ", rotary_test);
+            lcdLoopState = LCD_STATE_FORMAT_ACTIVE_PSUS;
+            break;
+
+        case LCD_STATE_FORMAT_ACTIVE_PSUS:
+            activePsus = '0';
+            maxInputVoltage = 0;
+            maxOutputTemp = 0;
+            for(int i = 0; i < 10; i++) {
+                if(psu[i].online) {
+                    activePsus++;
+                    if(psu[i].inputVoltage > maxInputVoltage) {
+                        maxInputVoltage = psu[i].inputVoltage;
+                    }
+                    if(psu[i].outputTemperature > maxOutputTemp) {
+                        maxOutputTemp = psu[i].outputTemperature;
+                    }
+                }
+            }
+            lcdLines[0][10] = activePsus;
+            lcdLoopState = LCD_STATE_FORMAT_VOLTAGE;
+            break;
+
+        case LCD_STATE_FORMAT_VOLTAGE:
+            snprintf(lcdLines[1], 8, "%03d.%02dV", maxInputVoltage / 100, maxInputVoltage % 100);
+            lcdLines[1][7] = ' ';  // Replace null with space to not cut off rest of string
+            lcdLoopState = LCD_STATE_FORMAT_TEMP;
+            break;
+
+        case LCD_STATE_FORMAT_TEMP:
+            snprintf(&lcdLines[1][8], 7, "%2d\337C  ", maxOutputTemp / 100);
+            lcdLines[1][14] = ' ';  // Replace null with space
+            lcdLines[1][15] = 0;    // Custom char 0 for snake
+            lcdLines[1][16] = '\0';
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+
+        case LCD_STATE_SNAKE_CHECK:
+            // Update snake animation every 227ms (5000ms / 22 frames)
+            if(millis() - lastSnakeUpdate >= 227) {
+                lastSnakeUpdate = millis();
+                // Load frame data from PROGMEM
+                for(int i = 0; i < 8; i++) {
+                    snakeCharData[i] = pgm_read_byte(&snakeFrames[snakeFrame][i]);
+                }
+                snakeFrame++;
+                if(snakeFrame >= 22) snakeFrame = 0;
+                snakeRowIndex = 0;
+                lcdLoopState = LCD_STATE_SNAKE_WRITE_ROW;
+            } else {
+                lcdLoopState = LCD_STATE_SETCURSOR_LINE_1;
+            }
+            break;
+
+        case LCD_STATE_SNAKE_WRITE_ROW:
+            // Write one row of custom char at a time
+            lcd.command(0x40 + snakeRowIndex);  // Set CGRAM address
+            lcd.write(snakeCharData[snakeRowIndex]);
+            snakeRowIndex++;
+            if(snakeRowIndex >= 8) {
+                lcdLoopState = LCD_STATE_SETCURSOR_LINE_1;
+            }
+            break;
+
+        case LCD_STATE_SETCURSOR_LINE_1:
+            lcd.setCursor(lcdCharIndex, 0);
+            lcdLoopState = LCD_STATE_WRITE_LINE_1;
+            break;
+
+        case LCD_STATE_WRITE_LINE_1:
+            lcd.write(lcdLines[0][lcdCharIndex]);
+            lcdCharIndex++;
+            if(lcdCharIndex >= 16) {
+                lcdCharIndex = 0;
+                lcdLoopState = LCD_STATE_SETCURSOR_LINE_2;
+            } else {
+                lcdLoopState = LCD_STATE_SETCURSOR_LINE_1;
+            }
+            break;
+
+        case LCD_STATE_SETCURSOR_LINE_2:
+            lcd.setCursor(lcdCharIndex, 1);
+            lcdLoopState = LCD_STATE_WRITE_LINE_2;
+            break;
+
+        case LCD_STATE_WRITE_LINE_2:
+            lcd.write(lcdLines[1][lcdCharIndex]);
+            lcdCharIndex++;
+            if(lcdCharIndex >= 16) {
+                lcdLoopState = LCD_STATE_FORMAT_ROTARY;
+            } else {
+                lcdLoopState = LCD_STATE_SETCURSOR_LINE_2;
+            }
+            break;
+    }
+}
+
 void loop() {
     psu_loop();
+    lcd_loop();
     uint32_t now = millis();
-
-    // Send Hello every 1 second
-    //if (now - lastSendTime >= 1000) {
-    //    lastSendTime = now;
-    //    debugPrintln("Hello");
-    //    UART9.println("Hello");
-    //    UART9.write9(0x1C0);
-    //}
 
     // Handle encoder rotation
     if (encoder) {
@@ -702,9 +925,9 @@ void loop() {
 
         if (newPosition != lastEncoderPosition) {
             if (newPosition > lastEncoderPosition) {
-                debugPrintln("+");
+                rotary_test++;
             } else {
-                debugPrintln("-");
+                rotary_test--;
             }
             lastEncoderPosition = newPosition;
         }
@@ -718,7 +941,7 @@ void loop() {
             lastButtonChange = now;
 
             if (currentButton) {
-                debugPrintln("P");
+                psu[0].setOutputEnable = !psu[0].setOutputEnable;
             }
         }
     } else {
