@@ -1097,6 +1097,7 @@ void lcd_loop()
 
                 // Format bottom line text based on mode
                 uint16_t val1, val2;
+                bool showCustomChars = false;
                 if (!psu[selectedPsu].online)
                 {
                     snprintf(lcdLines[1], 17, "OFFLINE         ");
@@ -1108,8 +1109,9 @@ void lcd_loop()
                     case HOMESCREEN_VALUES_VOLTAGES:
                         val1 = psu[selectedPsu].inputVoltage;
                         val2 = psu[selectedPsu].actVoltage;
-                        snprintf(lcdLines[1], 17, " %3d.%02d  %2d.%02d ",
+                        snprintf(lcdLines[1], 17, " %3d.%02dV  %2d.%02dV",
                                  val1 / 100, val1 % 100, val2 / 100, val2 % 100);
+                        showCustomChars = true;
                         break;
 
                     case HOMESCREEN_VALUES_INPUT:
@@ -1121,8 +1123,9 @@ void lcd_loop()
                         {
                             val1 = psu[selectedPsu].inputVoltage;
                             val2 = psu[selectedPsu].inputCurrent;
-                            snprintf(lcdLines[1], 17, " %3d.%02d  %2d.%02d ",
+                            snprintf(lcdLines[1], 17, " %3d.%02dV %2d.%02dA",
                                      val1 / 100, val1 % 100, val2 / 100, val2 % 100);
+                            showCustomChars = true;
                         }
                         break;
 
@@ -1135,23 +1138,29 @@ void lcd_loop()
                         {
                             val1 = psu[selectedPsu].actVoltage;
                             val2 = psu[selectedPsu].actCurrent;
-                            snprintf(lcdLines[1], 17, " %2d.%02d  %2d.%02d  ",
+                            snprintf(lcdLines[1], 17, " %2d.%02dV  %2d.%02dA",
                                      val1 / 100, val1 % 100, val2 / 100, val2 % 100);
+                            showCustomChars = true;
                         }
                         break;
 
                     case HOMESCREEN_VALUES_TEMPERATURES:
                         val1 = psu[selectedPsu].inputTemperature;
                         val2 = psu[selectedPsu].outputTemperature;
-                        snprintf(lcdLines[1], 17, " %2d.%02d\337  %2d.%02d\337",
+                        snprintf(lcdLines[1], 17, " %2d.%02d\337C %2d.%02d\337C",
                                  val1 / 100, val1 % 100, val2 / 100, val2 % 100);
+                        showCustomChars = true;
                         break;
                     }
                 }
-                // Insert custom char references
-                lcdLines[1][0] = 2;   // Custom char 2
-                lcdLines[1][8] = 3;   // Custom char 3
-                lcdLines[1][15] = ' '; // Ensure no null at end
+                // Insert custom char references only when showing values
+                if (showCustomChars)
+                {
+                    lcdLines[1][0] = 2;   // Custom char 2
+                    lcdLines[1][8] = 3;   // Custom char 3
+                    if (lcdLines[1][15] == '\0')
+                        lcdLines[1][15] = ' '; // Only replace null to avoid snake char
+                }
 
                 lcdCharIndex = 0;
                 homescreenState = HOMESCREEN_FORMAT_PSU_ROW;
