@@ -24,6 +24,7 @@
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
 RotaryEncoder *encoder = nullptr;
 long lastEncoderPosition = 0;
+long encoderPosition=0;
 volatile bool buttonRawState = false;
 bool lastButtonState = false;
 uint32_t lastButtonChange = 0;
@@ -745,12 +746,38 @@ void psu_loop()
     }
 }
 
+// Menu screens (top-level navigation)
+enum MenuScreen
+{
+    MENU_HOMESCREEN
+    // Future: MENU_SETTINGS, MENU_INFO, etc.
+};
+MenuScreen currentScreen = MENU_HOMESCREEN;
+
+// Homescreen internal states
+enum HomescreenState
+{
+    HOMESCREEN_FORMAT_PSU_ROW,
+    HOMESCREEN_FORMAT_ACTIVE_PSUS,
+    HOMESCREEN_FORMAT_WRITE_CHAR,
+    HOMESCREEN_FORMAT_BOTTOM_LINE
+};
+HomescreenState homescreenState = HOMESCREEN_FORMAT_PSU_ROW;
+
+// Homescreen bottom line display modes
+enum HomescreenBottomLineMode
+{
+    HOMESCREEN_VALUES_VOLTAGES,     // Vi and Vo
+    HOMESCREEN_VALUES_INPUT,        // Vi and Ci (or AC LOST)
+    HOMESCREEN_VALUES_OUTPUT,       // Vo and Co (or PSU STANDBY)
+    HOMESCREEN_VALUES_TEMPERATURES  // Ti and To
+};
+HomescreenBottomLineMode bottomLineMode = HOMESCREEN_VALUES_VOLTAGES;
+
+// LCD state machine (common for all screens)
 enum lcdLoopStates
 {
-    LCD_STATE_FORMAT_ROTARY,
-    LCD_STATE_FORMAT_ACTIVE_PSUS,
-    LCD_STATE_FORMAT_VOLTAGE,
-    LCD_STATE_FORMAT_TEMP,
+    LCD_STATE_PROCESS_CURRENT_SCREEN,
     LCD_STATE_SNAKE_CHECK,
     LCD_STATE_SNAKE_WRITE_ROW,
     LCD_STATE_SETCURSOR_LINE_1,
@@ -758,6 +785,8 @@ enum lcdLoopStates
     LCD_STATE_SETCURSOR_LINE_2,
     LCD_STATE_WRITE_LINE_2
 };
+
+uint8_t selectedPsu = 0;
 
 // Snake animation - border positions clockwise, 5 pixel snake
 // Border: 5x8 char, perimeter = 5+7+4+6 = 22 pixels (corners shared)
@@ -823,69 +852,316 @@ const uint8_t snakeFrames[22][8] PROGMEM = {
     // pos21=row1col0, pos20=row2col0, pos19=row3col0, pos18=row4col0, pos17=row5col0
     {0b00000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b00000, 0b00000}};
 
+// Normal small digits (1 pixel padding, centered)
+const uint8_t normalDigits[10][8] PROGMEM = {
+    {0b00000, 0b01110, 0b01010, 0b01010, 0b01010, 0b01110, 0b00000, 0b00000}, // 0
+    {0b00000, 0b00100, 0b01100, 0b00100, 0b00100, 0b01110, 0b00000, 0b00000}, // 1
+    {0b00000, 0b01110, 0b00010, 0b01110, 0b01000, 0b01110, 0b00000, 0b00000}, // 2
+    {0b00000, 0b01110, 0b00010, 0b01110, 0b00010, 0b01110, 0b00000, 0b00000}, // 3
+    {0b00000, 0b01010, 0b01010, 0b01110, 0b00010, 0b00010, 0b00000, 0b00000}, // 4
+    {0b00000, 0b01110, 0b01000, 0b01110, 0b00010, 0b01110, 0b00000, 0b00000}, // 5
+    {0b00000, 0b01110, 0b01000, 0b01110, 0b01010, 0b01110, 0b00000, 0b00000}, // 6
+    {0b00000, 0b01110, 0b00010, 0b00010, 0b00100, 0b00100, 0b00000, 0b00000}, // 7
+    {0b00000, 0b01110, 0b01010, 0b01110, 0b01010, 0b01110, 0b00000, 0b00000}, // 8
+    {0b00000, 0b01110, 0b01010, 0b01110, 0b00010, 0b01110, 0b00000, 0b00000}  // 9
+};
+
+// Inverted small digits (filled background with digit cut out)
+const uint8_t invertedDigits[10][8] PROGMEM = {
+    {0b11111, 0b10001, 0b10101, 0b10101, 0b10101, 0b10001, 0b11111, 0b11111}, // 0
+    {0b11111, 0b11011, 0b10011, 0b11011, 0b11011, 0b10001, 0b11111, 0b11111}, // 1
+    {0b11111, 0b10001, 0b11101, 0b10001, 0b10111, 0b10001, 0b11111, 0b11111}, // 2
+    {0b11111, 0b10001, 0b11101, 0b10001, 0b11101, 0b10001, 0b11111, 0b11111}, // 3
+    {0b11111, 0b10101, 0b10101, 0b10001, 0b11101, 0b11101, 0b11111, 0b11111}, // 4
+    {0b11111, 0b10001, 0b10111, 0b10001, 0b11101, 0b10001, 0b11111, 0b11111}, // 5
+    {0b11111, 0b10001, 0b10111, 0b10001, 0b10101, 0b10001, 0b11111, 0b11111}, // 6
+    {0b11111, 0b10001, 0b11101, 0b11101, 0b11011, 0b11011, 0b11111, 0b11111}, // 7
+    {0b11111, 0b10001, 0b10101, 0b10001, 0b10101, 0b10001, 0b11111, 0b11111}, // 8
+    {0b11111, 0b10001, 0b10101, 0b10001, 0b11101, 0b10001, 0b11111, 0b11111}  // 9
+};
+
+// Custom characters for bottom line labels (main letter + subscript)
+// Vi = Voltage In
+const uint8_t charVi[8] PROGMEM = {
+    0b10001,
+    0b10001,
+    0b01010,
+    0b00100,
+    0b00000,
+    0b10111,
+    0b10101,
+    0b10101
+};
+
+// Vo = Voltage Out
+const uint8_t charVo[8] PROGMEM = {
+    0b10001,
+    0b10001,
+    0b01010,
+    0b00100,
+    0b00000,
+    0b01110,
+    0b01010,
+    0b01110
+};
+
+// Ci = Current In
+const uint8_t charCi[8] PROGMEM = {
+    0b01111,
+    0b10000,
+    0b10000,
+    0b01111,
+    0b00000,
+    0b10111,
+    0b10101,
+    0b10101
+};
+
+// Co = Current Out
+const uint8_t charCo[8] PROGMEM = {
+    0b01111,
+    0b10000,
+    0b10000,
+    0b01111,
+    0b00000,
+    0b01110,
+    0b01010,
+    0b01110
+};
+
+// Ti = Temperature In
+const uint8_t charTi[8] PROGMEM = {
+    0b11111,
+    0b00100,
+    0b00100,
+    0b00100,
+    0b00000,
+    0b10111,
+    0b10101,
+    0b10101
+};
+
+// To = Temperature Out
+const uint8_t charTo[8] PROGMEM = {
+    0b11111,
+    0b00100,
+    0b00100,
+    0b00100,
+    0b00000,
+    0b01110,
+    0b01010,
+    0b01110
+};
+
 uint8_t snakeFrame = 0;
 uint8_t snakeRowIndex = 0;
 uint8_t snakeCharData[8];
 uint32_t lastSnakeUpdate = 0;
 
-lcdLoopStates lcdLoopState;
+lcdLoopStates lcdLoopState = LCD_STATE_PROCESS_CURRENT_SCREEN;
+
+// Inverted digit custom char data (loaded dynamically)
+uint8_t invertedCharData[8];
+uint8_t invertedCharRowIndex = 0;
 
 void lcd_loop()
 {
     static char lcdLines[2][17] = {"                ", "                "}; // 16 chars + null
     static uint8_t lcdCharIndex = 0;
-    static uint32_t lastLcdUpdate = 0;
-    static uint16_t maxInputVoltage = 0;
-    static uint16_t maxOutputTemp = 0;
     static char activePsus = '0';
 
     if (busState != BUS_IDLE && busState != READ_CYCLE_BUS_IDLE_AFTER_ACK && busState != READ_CYCLE_WAIT_FOR_SEND_ACK)
         return;
-    lastLcdUpdate = millis();
 
     switch (lcdLoopState)
     {
-    case LCD_STATE_FORMAT_ROTARY:
-        sprintf(lcdLines[0], "E:%3d   R:%5d ", unrecoverable_errors, retry_attempts);
-        lcdLoopState = LCD_STATE_FORMAT_ACTIVE_PSUS;
-        break;
-
-    case LCD_STATE_FORMAT_ACTIVE_PSUS:
-        activePsus = '0';
-        maxInputVoltage = 0;
-        maxOutputTemp = 0;
-        for (int i = 0; i < 10; i++)
+    case LCD_STATE_PROCESS_CURRENT_SCREEN:
+        switch (currentScreen)
         {
-            if (psu[i].online)
+        case MENU_HOMESCREEN:
+            switch (homescreenState)
             {
-                activePsus++;
-                if (psu[i].inputVoltage > maxInputVoltage)
+            case HOMESCREEN_FORMAT_PSU_ROW:
+            {
+                // Track encoder changes for menu navigation
+                static long lastEncoderForMenu = 0;
+
+                if (encoderPosition != lastEncoderForMenu)
                 {
-                    maxInputVoltage = psu[i].inputVoltage;
+                    if (encoderPosition > lastEncoderForMenu)
+                    {
+                        selectedPsu = (selectedPsu + 1) % 10;
+                    }
+                    else
+                    {
+                        selectedPsu = (selectedPsu + 9) % 10; // Wrap around backwards
+                    }
+                    lastEncoderForMenu = encoderPosition;
                 }
-                if (psu[i].outputTemperature > maxOutputTemp)
+
+                // Build PSU row: positions 0-9 show PSU status
+                activePsus = '0';
+                for (int i = 0; i < 10; i++)
                 {
-                    maxOutputTemp = psu[i].outputTemperature;
+                    if (i == selectedPsu)
+                    {
+                        lcdLines[0][i] = 1; // Custom char 1 (inverted digit)
+                    }
+                    else if (psu[i].online)
+                    {
+                        lcdLines[0][i] = '0' + i;
+                        activePsus++;
+                    }
+                    else
+                    {
+                        lcdLines[0][i] = ' ';
+                    }
                 }
+                // Count selected PSU if online (wasn't counted in loop above)
+                if (psu[selectedPsu].online)
+                {
+                    activePsus++;
+                }
+
+                // Positions 10-13: spaces, 14: count, 15: snake
+                lcdLines[0][10] = ' ';
+                lcdLines[0][11] = ' ';
+                lcdLines[0][12] = ' ';
+                lcdLines[0][13] = ' ';
+                lcdLines[0][14] = activePsus;
+                lcdLines[0][15] = 0; // Custom char 0 (snake)
+
+                homescreenState = HOMESCREEN_FORMAT_ACTIVE_PSUS;
+                break;
             }
+
+            case HOMESCREEN_FORMAT_ACTIVE_PSUS:
+                // Load inverted digit pattern for selected PSU into custom char 1
+                for (int i = 0; i < 8; i++)
+                {
+                    invertedCharData[i] = pgm_read_byte(&invertedDigits[selectedPsu][i]);
+                }
+                invertedCharRowIndex = 0;
+                homescreenState = HOMESCREEN_FORMAT_WRITE_CHAR;
+                break;
+
+            case HOMESCREEN_FORMAT_WRITE_CHAR:
+                // Write inverted char one row at a time (CGRAM address 0x48 = char 1)
+                lcd.command(0x48 + invertedCharRowIndex);
+                lcd.write(invertedCharData[invertedCharRowIndex]);
+                invertedCharRowIndex++;
+                if (invertedCharRowIndex >= 8)
+                {
+                    homescreenState = HOMESCREEN_FORMAT_BOTTOM_LINE;
+                }
+                break;
+
+            case HOMESCREEN_FORMAT_BOTTOM_LINE:
+            {
+                // Write custom chars 2 and 3 for bottom line icons
+                const uint8_t *char2Src;
+                const uint8_t *char3Src;
+                switch (bottomLineMode)
+                {
+                case HOMESCREEN_VALUES_VOLTAGES:
+                    char2Src = charVi;
+                    char3Src = charVo;
+                    break;
+                case HOMESCREEN_VALUES_INPUT:
+                    char2Src = charVi;
+                    char3Src = charCi;
+                    break;
+                case HOMESCREEN_VALUES_OUTPUT:
+                    char2Src = charVo;
+                    char3Src = charCo;
+                    break;
+                case HOMESCREEN_VALUES_TEMPERATURES:
+                default:
+                    char2Src = charTi;
+                    char3Src = charTo;
+                    break;
+                }
+
+                // Write char 2 to CGRAM
+                lcd.command(0x50);
+                for (int i = 0; i < 8; i++)
+                    lcd.write(pgm_read_byte(&char2Src[i]));
+
+                // Write char 3 to CGRAM
+                lcd.command(0x58);
+                for (int i = 0; i < 8; i++)
+                    lcd.write(pgm_read_byte(&char3Src[i]));
+
+                // Switch back to DDRAM
+                lcd.command(0x80);
+
+                // Format bottom line text based on mode
+                uint16_t val1, val2;
+                if (!psu[selectedPsu].online)
+                {
+                    snprintf(lcdLines[1], 17, "OFFLINE         ");
+                }
+                else
+                {
+                    switch (bottomLineMode)
+                    {
+                    case HOMESCREEN_VALUES_VOLTAGES:
+                        val1 = psu[selectedPsu].inputVoltage;
+                        val2 = psu[selectedPsu].actVoltage;
+                        snprintf(lcdLines[1], 17, " %3d.%02d  %2d.%02d ",
+                                 val1 / 100, val1 % 100, val2 / 100, val2 % 100);
+                        break;
+
+                    case HOMESCREEN_VALUES_INPUT:
+                        if (!psu[selectedPsu].acPresent)
+                        {
+                            snprintf(lcdLines[1], 17, "AC LOST         ");
+                        }
+                        else
+                        {
+                            val1 = psu[selectedPsu].inputVoltage;
+                            val2 = psu[selectedPsu].inputCurrent;
+                            snprintf(lcdLines[1], 17, " %3d.%02d  %2d.%02d ",
+                                     val1 / 100, val1 % 100, val2 / 100, val2 % 100);
+                        }
+                        break;
+
+                    case HOMESCREEN_VALUES_OUTPUT:
+                        if (!psu[selectedPsu].isOutputEnable)
+                        {
+                            snprintf(lcdLines[1], 17, "PSU STANDBY     ");
+                        }
+                        else
+                        {
+                            val1 = psu[selectedPsu].actVoltage;
+                            val2 = psu[selectedPsu].actCurrent;
+                            snprintf(lcdLines[1], 17, " %2d.%02d  %2d.%02d  ",
+                                     val1 / 100, val1 % 100, val2 / 100, val2 % 100);
+                        }
+                        break;
+
+                    case HOMESCREEN_VALUES_TEMPERATURES:
+                        val1 = psu[selectedPsu].inputTemperature;
+                        val2 = psu[selectedPsu].outputTemperature;
+                        snprintf(lcdLines[1], 17, " %2d.%02d\337  %2d.%02d\337",
+                                 val1 / 100, val1 % 100, val2 / 100, val2 % 100);
+                        break;
+                    }
+                }
+                // Insert custom char references
+                lcdLines[1][0] = 2;   // Custom char 2
+                lcdLines[1][8] = 3;   // Custom char 3
+                lcdLines[1][15] = ' '; // Ensure no null at end
+
+                lcdCharIndex = 0;
+                homescreenState = HOMESCREEN_FORMAT_PSU_ROW;
+                lcdLoopState = LCD_STATE_SNAKE_CHECK;
+                break;
+            }
+            }
+            break;
+        // Future: case MENU_SETTINGS: ...
         }
-        lcdLoopState = LCD_STATE_FORMAT_VOLTAGE;
-        break;
-
-    case LCD_STATE_FORMAT_VOLTAGE:
-        snprintf(lcdLines[1], 8, "%03d.%02dV", maxInputVoltage / 100, maxInputVoltage % 100);
-        lcdLines[1][7] = ' '; // Replace null with space to not cut off rest of string
-        lcdLoopState = LCD_STATE_FORMAT_TEMP;
-        break;
-
-    case LCD_STATE_FORMAT_TEMP:
-        snprintf(&lcdLines[1][8], 6, "%2d\337C ", maxOutputTemp / 100);
-        lcdLines[1][13] = ' '; // Replace null with space
-        lcdLines[1][14] = activePsus; // PSU count before snake
-        lcdLines[1][15] = 0;   // Custom char 0 for snake
-        lcdLines[1][16] = '\0';
-        lcdCharIndex = 0;
-        lcdLoopState = LCD_STATE_SNAKE_CHECK;
         break;
 
     case LCD_STATE_SNAKE_CHECK:
@@ -912,7 +1188,7 @@ void lcd_loop()
 
     case LCD_STATE_SNAKE_WRITE_ROW:
         // Write one row of custom char at a time
-        lcd.command(0x40 + snakeRowIndex); // Set CGRAM address
+        lcd.command(0x40 + snakeRowIndex); // Set CGRAM address for char 0
         lcd.write(snakeCharData[snakeRowIndex]);
         snakeRowIndex++;
         if (snakeRowIndex >= 8)
@@ -950,7 +1226,7 @@ void lcd_loop()
         lcdCharIndex++;
         if (lcdCharIndex >= 16)
         {
-            lcdLoopState = LCD_STATE_FORMAT_ROTARY;
+            lcdLoopState = LCD_STATE_PROCESS_CURRENT_SCREEN;
         }
         else
         {
@@ -976,11 +1252,11 @@ void loop()
         {
             if (newPosition > lastEncoderPosition)
             {
-                unrecoverable_errors++;
+                encoderPosition++;
             }
             else
             {
-                unrecoverable_errors--;
+                encoderPosition--;
             }
             lastEncoderPosition = newPosition;
         }
@@ -997,7 +1273,13 @@ void loop()
 
             if (currentButton)
             {
-                psu[0].setOutputEnable = !psu[0].setOutputEnable;
+                // On home screen, cycle through bottom line display modes
+                if (currentScreen == MENU_HOMESCREEN)
+                {
+                    bottomLineMode = static_cast<HomescreenBottomLineMode>(
+                        (bottomLineMode + 1) % 4
+                    );
+                }
             }
         }
     }
