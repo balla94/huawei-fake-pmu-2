@@ -28,6 +28,9 @@ long encoderPosition=0;
 volatile bool buttonRawState = false;
 bool lastButtonState = false;
 uint32_t lastButtonChange = 0;
+uint32_t buttonPressStart = 0;
+bool longPressHandled = false;
+const uint32_t LONG_PRESS_MS = 500;
 
 // =============================================================================
 // DEBUG UART (USART0)
@@ -749,8 +752,8 @@ void psu_loop()
 // Menu screens (top-level navigation)
 enum MenuScreen
 {
-    MENU_HOMESCREEN
-    // Future: MENU_SETTINGS, MENU_INFO, etc.
+    MENU_HOMESCREEN,
+    MENU_OPTIONS
 };
 MenuScreen currentScreen = MENU_HOMESCREEN;
 
@@ -773,6 +776,24 @@ enum HomescreenBottomLineMode
     HOMESCREEN_VALUES_TEMPERATURES  // Ti and To
 };
 HomescreenBottomLineMode bottomLineMode = HOMESCREEN_VALUES_VOLTAGES;
+
+// Options menu items
+enum OptionsMenuItem
+{
+    OPTIONS_LOAD_SHARING,
+    OPTIONS_PARAMETERS,
+    OPTIONS_PSU_ENABLE,
+    OPTIONS_EXIT
+};
+OptionsMenuItem selectedOption = OPTIONS_LOAD_SHARING;
+
+// Options menu item labels (centered in 14 chars between < and >)
+const char* const optionLabels[] = {
+    " LoadSharing  ",
+    "  Parameters  ",
+    "  PSU enable  ",
+    "     EXIT     "
+};
 
 // LCD state machine (common for all screens)
 enum lcdLoopStates
@@ -1169,7 +1190,18 @@ void lcd_loop()
             }
             }
             break;
-        // Future: case MENU_SETTINGS: ...
+
+        case MENU_OPTIONS:
+            // Top line: "    OPTIONS    " with snake at position 15
+            snprintf(lcdLines[0], 16, "    OPTIONS    ");
+            lcdLines[0][15] = 0; // Snake char
+            // Bottom line: "< option name >"
+            lcdLines[1][0] = '<';
+            memcpy(&lcdLines[1][1], optionLabels[selectedOption], 14);
+            lcdLines[1][15] = '>';
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
         }
         break;
 
@@ -1259,19 +1291,26 @@ void loop()
 
         if (newPosition != lastEncoderPosition)
         {
-            if (newPosition > lastEncoderPosition)
-            {
-                encoderPosition++;
-            }
-            else
-            {
-                encoderPosition--;
-            }
+            int8_t delta = (newPosition > lastEncoderPosition) ? 1 : -1;
             lastEncoderPosition = newPosition;
+
+            if (currentScreen == MENU_HOMESCREEN)
+            {
+                // Select PSU on homescreen
+                encoderPosition += delta;
+            }
+            else if (currentScreen == MENU_OPTIONS)
+            {
+                // Cycle through options menu items
+                int8_t newOption = (int8_t)selectedOption + delta;
+                if (newOption < 0) newOption = 3;
+                if (newOption > 3) newOption = 0;
+                selectedOption = (OptionsMenuItem)newOption;
+            }
         }
     }
 
-    // Handle button press with debounce
+    // Handle button press with debounce and long press detection
     bool currentButton = buttonRawState;
     if (currentButton != lastButtonState)
     {
@@ -1282,12 +1321,32 @@ void loop()
 
             if (currentButton)
             {
-                // On home screen, cycle through bottom line display modes
-                if (currentScreen == MENU_HOMESCREEN)
+                // Button just pressed - record start time
+                buttonPressStart = now;
+                longPressHandled = false;
+            }
+            else
+            {
+                // Button released - handle short press if long press wasn't triggered
+                if (!longPressHandled)
                 {
-                    bottomLineMode = static_cast<HomescreenBottomLineMode>(
-                        (bottomLineMode + 1) % 4
-                    );
+                    if (currentScreen == MENU_HOMESCREEN)
+                    {
+                        // Short press on homescreen: cycle through bottom line modes
+                        bottomLineMode = static_cast<HomescreenBottomLineMode>(
+                            (bottomLineMode + 1) % 4
+                        );
+                    }
+                    else if (currentScreen == MENU_OPTIONS)
+                    {
+                        // Short press on options: select current option
+                        if (selectedOption == OPTIONS_EXIT)
+                        {
+                            currentScreen = MENU_HOMESCREEN;
+                            selectedOption = OPTIONS_LOAD_SHARING; // Reset for next time
+                        }
+                        // A, B, C do nothing for now
+                    }
                 }
             }
         }
@@ -1295,5 +1354,20 @@ void loop()
     else
     {
         lastButtonChange = now;
+    }
+
+    // Check for long press while button is held
+    if (lastButtonState && !longPressHandled)
+    {
+        if (now - buttonPressStart >= LONG_PRESS_MS)
+        {
+            longPressHandled = true;
+            if (currentScreen == MENU_HOMESCREEN)
+            {
+                // Long press on homescreen: enter OPTIONS menu
+                currentScreen = MENU_OPTIONS;
+                selectedOption = OPTIONS_LOAD_SHARING;
+            }
+        }
     }
 }
