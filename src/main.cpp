@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <EEPROM.h>
 #include "pinout.h"
 #include "LiquidCrystal_I2C.h"
 #include <RotaryEncoder.h>
@@ -14,6 +15,7 @@
 #include "UART_Classes.h"
 
 #include "PSU_Constants.h"
+#include "config.h"
 
 #define BUS_RX_BUFFER_LENGTH 64
 
@@ -133,6 +135,7 @@ struct PSU
     uint16_t actCurrent;
     bool setOutputEnable;
     bool isOutputEnable;
+    bool wasOnBus;          // Persisted in EEPROM - true if PSU was ever seen on bus
     String deviceInfo;
     uint16_t inputVoltage;
     uint16_t inputCurrent;
@@ -148,6 +151,254 @@ struct PSU
 };
 
 PSU psu[10];
+
+// =============================================================================
+// EEPROM PERSISTENT STORAGE
+// =============================================================================
+
+// Per-PSU settings stored in EEPROM
+struct PsuEepromData
+{
+    uint16_t setVoltage;      // 3000-6000 (30.00V - 60.00V)
+    uint16_t setCurrent;      // 100-5000 (1.00A - 50.00A)
+    bool outputEnabled;       // Output enable state
+    bool wasOnBus;            // True if PSU was ever seen on bus
+};
+
+// Global settings stored in EEPROM
+struct EepromConfig
+{
+    uint16_t magic;           // Magic number to validate EEPROM
+    uint8_t version;          // Config version for future compatibility
+    bool groupMode;           // True = all PSUs use group voltage/current
+    uint16_t groupVoltage;    // Group voltage setting (3000-6000)
+    uint16_t groupCurrent;    // Group current setting (100-50000)
+    bool alwaysOnBacklight;   // True = backlight always on
+    PsuEepromData psuData[10]; // Per-PSU settings
+    uint8_t crc;              // CRC of all preceding bytes
+};
+
+EepromConfig eepromConfig;
+
+// Backlight timeout tracking (for On Alert mode)
+#define BACKLIGHT_TIMEOUT_MS 30000
+uint32_t lastEncoderActivityTime = 0;
+bool backlightCurrentlyOn = true;
+
+// Calculate CRC8 for EEPROM data
+uint8_t calculateEepromCrc(const uint8_t *data, size_t length)
+{
+    uint8_t crc = 0;
+    for (size_t i = 0; i < length; i++)
+    {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; bit++)
+        {
+            if (crc & 0x80)
+                crc = (crc << 1) ^ 0x07; // CRC-8 polynomial
+            else
+                crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+// Write EEPROM config to flash
+void eepromSave()
+{
+    // Calculate CRC over all data except the CRC byte itself
+    eepromConfig.crc = calculateEepromCrc((uint8_t *)&eepromConfig, sizeof(EepromConfig) - 1);
+
+    debugPrintln("[EEPROM] Saving configuration...");
+
+    uint8_t *ptr = (uint8_t *)&eepromConfig;
+    for (size_t i = 0; i < sizeof(EepromConfig); i++)
+    {
+        EEPROM.write(i, ptr[i]);
+    }
+
+    char debugMsg[60];
+    sprintf(debugMsg, "[EEPROM] Saved %d bytes, CRC=0x%02X", (int)sizeof(EepromConfig), eepromConfig.crc);
+    debugPrintln(debugMsg);
+}
+
+// Load EEPROM config from flash
+bool eepromLoad()
+{
+    debugPrintln("[EEPROM] Loading configuration...");
+
+    uint8_t *ptr = (uint8_t *)&eepromConfig;
+    for (size_t i = 0; i < sizeof(EepromConfig); i++)
+    {
+        ptr[i] = EEPROM.read(i);
+    }
+
+    char debugMsg[80];
+    sprintf(debugMsg, "[EEPROM] Read %d bytes, magic=0x%04X, ver=%d",
+            (int)sizeof(EepromConfig), eepromConfig.magic, eepromConfig.version);
+    debugPrintln(debugMsg);
+
+    // Validate magic number
+    if (eepromConfig.magic != EEPROM_MAGIC)
+    {
+        sprintf(debugMsg, "[EEPROM] Invalid magic: 0x%04X (expected 0x%04X)",
+                eepromConfig.magic, EEPROM_MAGIC);
+        debugPrintln(debugMsg);
+        return false;
+    }
+
+    // Validate CRC
+    uint8_t expectedCrc = calculateEepromCrc((uint8_t *)&eepromConfig, sizeof(EepromConfig) - 1);
+    if (eepromConfig.crc != expectedCrc)
+    {
+        sprintf(debugMsg, "[EEPROM] CRC mismatch: 0x%02X (expected 0x%02X)",
+                eepromConfig.crc, expectedCrc);
+        debugPrintln(debugMsg);
+        return false;
+    }
+
+    debugPrintln("[EEPROM] Configuration valid");
+    return true;
+}
+
+// Initialize EEPROM with default values
+void eepromInitDefaults()
+{
+    debugPrintln("[EEPROM] Initializing with defaults...");
+
+    eepromConfig.magic = EEPROM_MAGIC;
+    eepromConfig.version = EEPROM_VERSION;
+    eepromConfig.groupMode = DEFAULT_GROUP_MODE;
+    eepromConfig.groupVoltage = PSU_VOLTAGE_DEFAULT;
+    eepromConfig.groupCurrent = GROUP_CURRENT_DEFAULT;
+    eepromConfig.alwaysOnBacklight = DEFAULT_ALWAYS_ON_BACKLIGHT;
+
+    for (int i = 0; i < 10; i++)
+    {
+        eepromConfig.psuData[i].setVoltage = PSU_VOLTAGE_DEFAULT;
+        eepromConfig.psuData[i].setCurrent = PSU_CURRENT_DEFAULT;
+        eepromConfig.psuData[i].outputEnabled = DEFAULT_OUTPUT_ENABLED;
+        eepromConfig.psuData[i].wasOnBus = DEFAULT_WAS_ON_BUS;
+    }
+
+    eepromSave();
+    debugPrintln("[EEPROM] Defaults saved");
+}
+
+// Apply EEPROM config to PSU runtime data
+void eepromApplyConfig()
+{
+    char debugMsg[80];
+
+    if (eepromConfig.groupMode)
+    {
+        debugPrintln("[EEPROM] Group mode active - applying group settings");
+        sprintf(debugMsg, "[EEPROM] Group: V=%d.%02dV, C=%d.%02dA",
+                eepromConfig.groupVoltage / 100, eepromConfig.groupVoltage % 100,
+                eepromConfig.groupCurrent / 100, eepromConfig.groupCurrent % 100);
+        debugPrintln(debugMsg);
+
+        for (int i = 0; i < 10; i++)
+        {
+            psu[i].setVoltage = eepromConfig.groupVoltage;
+            psu[i].setCurrent = eepromConfig.groupCurrent;
+            psu[i].wasOnBus = eepromConfig.psuData[i].wasOnBus;
+            // In group mode, output enable is handled globally, but we still load the flag
+            psu[i].setOutputEnable = eepromConfig.psuData[i].outputEnabled;
+        }
+    }
+    else
+    {
+        debugPrintln("[EEPROM] Individual mode - applying per-PSU settings");
+
+        for (int i = 0; i < 10; i++)
+        {
+            psu[i].setVoltage = eepromConfig.psuData[i].setVoltage;
+            psu[i].setCurrent = eepromConfig.psuData[i].setCurrent;
+            psu[i].setOutputEnable = eepromConfig.psuData[i].outputEnabled;
+            psu[i].wasOnBus = eepromConfig.psuData[i].wasOnBus;
+
+            sprintf(debugMsg, "[EEPROM] PSU%d: V=%d.%02dV, C=%d.%02dA, Out=%d, WasOnBus=%d",
+                    i,
+                    psu[i].setVoltage / 100, psu[i].setVoltage % 100,
+                    psu[i].setCurrent / 100, psu[i].setCurrent % 100,
+                    psu[i].setOutputEnable, psu[i].wasOnBus);
+            debugPrintln(debugMsg);
+        }
+    }
+}
+
+// Update wasOnBus flag for a specific PSU and save to EEPROM
+void eepromSetWasOnBus(uint8_t psuIndex)
+{
+    if (psuIndex >= 10) return;
+    if (eepromConfig.psuData[psuIndex].wasOnBus) return; // Already set
+
+    char debugMsg[50];
+    sprintf(debugMsg, "[EEPROM] PSU%d first seen on bus, saving", psuIndex);
+    debugPrintln(debugMsg);
+
+    eepromConfig.psuData[psuIndex].wasOnBus = true;
+    psu[psuIndex].wasOnBus = true;
+    eepromSave();
+}
+
+// Software reset using watchdog
+void softwareReset()
+{
+    debugPrintln("[SYSTEM] Rebooting...");
+    delay(100); // Allow debug message to be sent
+
+    // Use watchdog timer for reset
+    _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8CLK_gc); // Shortest timeout
+    while (1) {} // Wait for watchdog reset
+}
+
+// Helper: Get digit from value at position (0=tens, 1=ones, 2=tenths, 3=hundredths)
+uint8_t getDigitFromValue(uint16_t value, uint8_t pos)
+{
+    switch (pos)
+    {
+    case 0: return (value / 1000) % 10;      // Tens
+    case 1: return (value / 100) % 10;       // Ones
+    case 2: return (value / 10) % 10;        // Tenths
+    case 3: return value % 10;               // Hundredths
+    default: return 0;
+    }
+}
+
+// Helper: Set digit in value at position, respecting min/max limits
+uint16_t setDigitInValue(uint16_t value, uint8_t pos, int8_t delta, uint16_t minVal, uint16_t maxVal)
+{
+    // Get current digit and calculate new digit
+    int16_t digit = getDigitFromValue(value, pos);
+    digit += delta;
+
+    // Wrap digit 0-9
+    if (digit > 9) digit = 0;
+    if (digit < 0) digit = 9;
+
+    // Calculate multiplier for position
+    uint16_t multiplier = 1;
+    switch (pos)
+    {
+    case 0: multiplier = 1000; break;
+    case 1: multiplier = 100; break;
+    case 2: multiplier = 10; break;
+    case 3: multiplier = 1; break;
+    }
+
+    // Calculate new value
+    uint16_t oldDigitValue = getDigitFromValue(value, pos) * multiplier;
+    uint16_t newDigitValue = digit * multiplier;
+    int32_t newValue = (int32_t)value - oldDigitValue + newDigitValue;
+
+    // Clamp to valid range
+    if (newValue < minVal) newValue = minVal;
+    if (newValue > maxVal) newValue = maxVal;
+
+    return (uint16_t)newValue;
+}
 
 uint8_t unrecoverable_errors = 0;
 uint8_t retry_attempts = 0;
@@ -192,9 +443,10 @@ void reset_psu_struct()
     {
         psu[i].online = false;
         psu[i].busAction = ACTION_PSU_INIT;
-        psu[i].setVoltage = 5200;
-        psu[i].setCurrent = 100;
-        psu[i].setOutputEnable = false;
+        psu[i].setVoltage = PSU_VOLTAGE_DEFAULT;
+        psu[i].setCurrent = PSU_CURRENT_DEFAULT;
+        psu[i].setOutputEnable = DEFAULT_OUTPUT_ENABLED;
+        psu[i].wasOnBus = DEFAULT_WAS_ON_BUS;
         psu[i].offline_ignored_poll_cycles = 0;
     }
 }
@@ -250,6 +502,21 @@ void setup()
     timer = millis();
     retry_count = 0;
     reset_psu_struct();
+
+    // Initialize EEPROM configuration
+    if (!eepromLoad())
+    {
+        // EEPROM invalid or first boot - initialize with defaults
+        eepromInitDefaults();
+    }
+    // Apply EEPROM config to PSU runtime data
+    eepromApplyConfig();
+
+    // Initialize backlight state from EEPROM
+    lastEncoderActivityTime = millis();
+    backlightCurrentlyOn = true; // Already turned on above
+
+    debugPrintln("Boot complete");
 }
 
 void processAnswer(uint8_t psu_id, const uint8_t *buffer, uint8_t length)
@@ -318,12 +585,12 @@ void processAnswer(uint8_t psu_id, const uint8_t *buffer, uint8_t length)
         if (buffer[7] == 0x00)
         {
             psu[psu_id].setVoltageError = true;
-            debugPrintln("VSET error");
+            debugPrintln("VSET OK");
         }
         else
         {
             psu[psu_id].setVoltageError = false;
-            debugPrintln("VSET OK");
+            debugPrintln("VSET Error");
         }
         break;
     }
@@ -525,7 +792,9 @@ void psu_loop()
         {
             busState = READ_CYCLE_BUS_IDLE_AFTER_ACK;
             timer = millis();
+            bool wasOffline = !psu[psu_id].online;
             psu[psu_id].online = true;
+            if (wasOffline) eepromSetWasOnBus(psu_id);
             debugPrint("noRx");
         }
         // If we have the same amount in the buffer that we expects from the header,
@@ -536,7 +805,9 @@ void psu_loop()
             {
                 debugPrint("CRC OK");
                 retry_count = 0;
+                bool wasOffline = !psu[psu_id].online;
                 psu[psu_id].online = true;
+                if (wasOffline) eepromSetWasOnBus(psu_id);
                 processAnswer(psu_id, bus_rx, bus_rx_length);
                 busState = READ_CYCLE_WAIT_FOR_SEND_ACK;
                 timer = millis();
@@ -731,7 +1002,9 @@ void psu_loop()
             if (rx == PSU_ACK)
             {
                 debugPrintln("Got ACK");
+                bool wasOffline = !psu[psu_id].online;
                 psu[psu_id].online = true;
+                if (wasOffline) eepromSetWasOnBus(psu_id);
 
                 // Only move to next PSU when we've completed the full cycle
                 // (when we're back at ACTION_GET_AC_PARAMETERS, which means
@@ -753,9 +1026,55 @@ void psu_loop()
 enum MenuScreen
 {
     MENU_HOMESCREEN,
-    MENU_OPTIONS
+    MENU_OPTIONS,
+    MENU_LOADSHARING_SELECT,   // < ON OFF selection
+    MENU_LOADSHARING_VGROUP,   // SET VGROUP with digit editing
+    MENU_LOADSHARING_CGROUP,   // SET CGROUP with digit editing
+    MENU_PARAMETERS_PSU_SELECT, // Select PSU 0-9 or <
+    MENU_PARAMETERS_ONOFF,      // < ON OFF for selected PSU
+    MENU_PARAMETERS_VSET,       // VSET for individual PSU
+    MENU_PARAMETERS_CSET,       // CSET for individual PSU
+    MENU_FORGET_PSU,            // Forget offline PSUs YES/NO
+    MENU_BACKLIGHT_SELECT,      // Backlight mode selection
+    MENU_MESSAGE_DISPLAY        // Temporary message display
 };
 MenuScreen currentScreen = MENU_HOMESCREEN;
+
+// LoadSharing menu state
+enum LoadSharingSelection
+{
+    LS_SEL_BACK = 0,   // <
+    LS_SEL_ON = 1,     // ON
+    LS_SEL_OFF = 2     // OFF
+};
+LoadSharingSelection lsSelection = LS_SEL_ON;
+
+// Parameters menu state
+uint8_t paramSelectedPsu = 0;    // 0-9 for PSU, 10 for < (back)
+enum ParamOnOffSelection
+{
+    PARAM_SEL_BACK = 0,   // <
+    PARAM_SEL_ON = 1,     // ON
+    PARAM_SEL_OFF = 2     // OFF
+};
+ParamOnOffSelection paramOnOff = PARAM_SEL_ON;
+uint8_t editingPsu = 0;          // Which PSU we're editing (0-9)
+
+// Message display state
+uint32_t messageStartTime = 0;
+const uint32_t MESSAGE_DISPLAY_MS = 2000;
+MenuScreen returnScreen = MENU_OPTIONS;  // Screen to return to after message
+
+// Value editing state
+uint8_t editCursorPos = 0;     // 0-4 for digits, 5 for > button
+bool editMode = false;          // true = editing digit, false = cursor mode
+uint16_t editVoltage = 0;       // Temporary voltage during editing
+uint16_t editCurrent = 0;       // Temporary current during editing
+
+// Blinking state for cursor
+uint32_t blinkTimer = 0;
+bool blinkState = false;
+const uint32_t BLINK_INTERVAL_MS = 300;
 
 // Homescreen internal states
 enum HomescreenState
@@ -782,7 +1101,8 @@ enum OptionsMenuItem
 {
     OPTIONS_LOAD_SHARING,
     OPTIONS_PARAMETERS,
-    OPTIONS_PSU_ENABLE,
+    OPTIONS_FORGET_PSU,
+    OPTIONS_BACKLIGHT,
     OPTIONS_EXIT
 };
 OptionsMenuItem selectedOption = OPTIONS_LOAD_SHARING;
@@ -791,9 +1111,26 @@ OptionsMenuItem selectedOption = OPTIONS_LOAD_SHARING;
 const char* const optionLabels[] = {
     " LoadSharing  ",
     "  Parameters  ",
-    "  PSU enable  ",
+    "  Forget PSU  ",
+    "   Backlight  ",
     "     EXIT     "
 };
+
+// Forget PSU menu state
+enum ForgetPsuSelection
+{
+    FORGET_SEL_NO = 0,
+    FORGET_SEL_YES = 1
+};
+ForgetPsuSelection forgetSelection = FORGET_SEL_NO;
+
+// Backlight mode selection
+enum BacklightSelection
+{
+    BACKLIGHT_ALWAYS_ON = 0,
+    BACKLIGHT_ON_ALERT = 1
+};
+BacklightSelection backlightSelection = BACKLIGHT_ALWAYS_ON;
 
 // LCD state machine (common for all screens)
 enum lcdLoopStates
@@ -1033,9 +1370,13 @@ void lcd_loop()
                         lcdLines[0][i] = '0' + i;
                         activePsus++;
                     }
+                    else if (psu[i].wasOnBus)
+                    {
+                        lcdLines[0][i] = 'x'; // Offline but was previously on bus
+                    }
                     else
                     {
-                        lcdLines[0][i] = ' ';
+                        lcdLines[0][i] = ' '; // Never seen on bus
                     }
                 }
                 // Count selected PSU if online (wasn't counted in loop above)
@@ -1202,6 +1543,330 @@ void lcd_loop()
             lcdCharIndex = 0;
             lcdLoopState = LCD_STATE_SNAKE_CHECK;
             break;
+
+        case MENU_LOADSHARING_SELECT:
+        {
+            // Top line: "  LoadSharing  " with snake at position 15
+            snprintf(lcdLines[0], 16, "  LoadSharing  ");
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "< ON OFF" with brackets around selected item
+            // Format: "[<] ON  OFF " or " <  [ON] OFF " or " <  ON  [OFF]"
+            if (lsSelection == LS_SEL_BACK)
+                snprintf(lcdLines[1], 17, "[<]  ON   OFF   ");
+            else if (lsSelection == LS_SEL_ON)
+                snprintf(lcdLines[1], 17, " <  [ON]  OFF   ");
+            else
+                snprintf(lcdLines[1], 17, " <   ON  [OFF]  ");
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_LOADSHARING_VGROUP:
+        {
+            // Update blink state
+            if (millis() - blinkTimer >= BLINK_INTERVAL_MS)
+            {
+                blinkTimer = millis();
+                blinkState = !blinkState;
+            }
+
+            // Top line: " SET VGROUP   " with snake at position 15
+            snprintf(lcdLines[0], 16, "  SET VGROUP   ");
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "VSET: XX.XXV [>]"
+            // Format voltage as XX.XX
+            uint8_t d0 = getDigitFromValue(editVoltage, 0);
+            uint8_t d1 = getDigitFromValue(editVoltage, 1);
+            uint8_t d2 = getDigitFromValue(editVoltage, 2);
+            uint8_t d3 = getDigitFromValue(editVoltage, 3);
+
+            // Build the line with cursor indication
+            snprintf(lcdLines[1], 17, "VSET: %d%d.%d%dV   ",
+                     d0, d1, d2, d3);
+
+            // Add > button at end
+            if (editCursorPos == 4)
+                snprintf(&lcdLines[1][13], 4, "[>]");
+            else
+                snprintf(&lcdLines[1][13], 4, " > ");
+
+            // Handle blinking for cursor/edit mode
+            // Digit positions in string: 6, 7, 9, 10 (positions 0,1,2,3)
+            const uint8_t digitPos[] = {6, 7, 9, 10};
+            if (editCursorPos < 4)
+            {
+                uint8_t pos = digitPos[editCursorPos];
+                if (editMode)
+                {
+                    // Edit mode: blink the entire character
+                    if (blinkState)
+                        lcdLines[1][pos] = ' ';
+                }
+                else
+                {
+                    // Cursor mode: show underline (using underscore, or use blinking to indicate)
+                    if (blinkState)
+                        lcdLines[1][pos] = '_';
+                }
+            }
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_LOADSHARING_CGROUP:
+        {
+            // Update blink state
+            if (millis() - blinkTimer >= BLINK_INTERVAL_MS)
+            {
+                blinkTimer = millis();
+                blinkState = !blinkState;
+            }
+
+            // Top line: " SET CGROUP   " with snake at position 15
+            snprintf(lcdLines[0], 16, "  SET CGROUP   ");
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "CSET: XXX.XXA [>]"
+            // For group current, we have 5 digits (100-50000 = 1.00A to 500.00A)
+            // Format as XXX.XX
+            uint16_t currentVal = editCurrent;
+            snprintf(lcdLines[1], 17, "CSET:%3d.%02dA   ",
+                     currentVal / 100, currentVal % 100);
+
+            // Add > button at end
+            if (editCursorPos == 5)
+                snprintf(&lcdLines[1][13], 4, "[>]");
+            else
+                snprintf(&lcdLines[1][13], 4, " > ");
+
+            // Handle blinking for cursor/edit mode
+            // Digit positions in string: 5, 6, 7, 9, 10 (for XXX.XX format)
+            const uint8_t digitPos[] = {5, 6, 7, 9, 10};
+            if (editCursorPos < 5)
+            {
+                uint8_t pos = digitPos[editCursorPos];
+                uint8_t digit = 0;
+                switch (editCursorPos)
+                {
+                case 0: digit = (currentVal / 10000) % 10; break;
+                case 1: digit = (currentVal / 1000) % 10; break;
+                case 2: digit = (currentVal / 100) % 10; break;
+                case 3: digit = (currentVal / 10) % 10; break;
+                case 4: digit = currentVal % 10; break;
+                }
+                (void)digit; // Suppress unused warning
+
+                if (editMode)
+                {
+                    // Edit mode: blink the entire character
+                    if (blinkState)
+                        lcdLines[1][pos] = ' ';
+                }
+                else
+                {
+                    // Cursor mode: show underline
+                    if (blinkState)
+                        lcdLines[1][pos] = '_';
+                }
+            }
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_PARAMETERS_PSU_SELECT:
+        {
+            // Top line: "  Parameters   " with snake at position 15
+            snprintf(lcdLines[0], 16, "  Parameters   ");
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "Select PSU: X" where X is 0-9 or <
+            if (paramSelectedPsu < 10)
+            {
+                snprintf(lcdLines[1], 17, " Select PSU:[%d] ", paramSelectedPsu);
+            }
+            else
+            {
+                snprintf(lcdLines[1], 17, " Select PSU:[<] ");
+            }
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_PARAMETERS_ONOFF:
+        {
+            // Top line: "  SET PSU X    " with snake at position 15
+            snprintf(lcdLines[0], 16, "   SET PSU %d   ", editingPsu);
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "[<] ON OFF" or "< [ON] OFF" or "< ON [OFF]"
+            if (paramOnOff == PARAM_SEL_BACK)
+                snprintf(lcdLines[1], 17, "[<]  ON   OFF   ");
+            else if (paramOnOff == PARAM_SEL_ON)
+                snprintf(lcdLines[1], 17, " <  [ON]  OFF   ");
+            else
+                snprintf(lcdLines[1], 17, " <   ON  [OFF]  ");
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_PARAMETERS_VSET:
+        {
+            // Update blink state
+            if (millis() - blinkTimer >= BLINK_INTERVAL_MS)
+            {
+                blinkTimer = millis();
+                blinkState = !blinkState;
+            }
+
+            // Top line: " VSET PSU X    " with snake at position 15
+            snprintf(lcdLines[0], 16, "  VSET PSU %d   ", editingPsu);
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "VSET: XX.XXV [>]"
+            uint8_t d0 = getDigitFromValue(editVoltage, 0);
+            uint8_t d1 = getDigitFromValue(editVoltage, 1);
+            uint8_t d2 = getDigitFromValue(editVoltage, 2);
+            uint8_t d3 = getDigitFromValue(editVoltage, 3);
+
+            snprintf(lcdLines[1], 17, "VSET: %d%d.%d%dV   ",
+                     d0, d1, d2, d3);
+
+            // Add > button at end
+            if (editCursorPos == 4)
+                snprintf(&lcdLines[1][13], 4, "[>]");
+            else
+                snprintf(&lcdLines[1][13], 4, " > ");
+
+            // Handle blinking for cursor/edit mode
+            const uint8_t digitPos[] = {6, 7, 9, 10};
+            if (editCursorPos < 4)
+            {
+                uint8_t pos = digitPos[editCursorPos];
+                if (editMode)
+                {
+                    if (blinkState)
+                        lcdLines[1][pos] = ' ';
+                }
+                else
+                {
+                    if (blinkState)
+                        lcdLines[1][pos] = '_';
+                }
+            }
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_PARAMETERS_CSET:
+        {
+            // Update blink state
+            if (millis() - blinkTimer >= BLINK_INTERVAL_MS)
+            {
+                blinkTimer = millis();
+                blinkState = !blinkState;
+            }
+
+            // Top line: " CSET PSU X    " with snake at position 15
+            snprintf(lcdLines[0], 16, "  CSET PSU %d   ", editingPsu);
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "CSET: XX.XXA [>]"
+            // Individual PSU current range is 100-5000 (1.00A - 50.00A)
+            snprintf(lcdLines[1], 17, "CSET: %2d.%02dA   ",
+                     editCurrent / 100, editCurrent % 100);
+
+            // Add > button at end
+            if (editCursorPos == 4)
+                snprintf(&lcdLines[1][13], 4, "[>]");
+            else
+                snprintf(&lcdLines[1][13], 4, " > ");
+
+            // Handle blinking for cursor/edit mode
+            // Digit positions: 6, 7, 9, 10 (for XX.XX format)
+            const uint8_t digitPos[] = {6, 7, 9, 10};
+            if (editCursorPos < 4)
+            {
+                uint8_t pos = digitPos[editCursorPos];
+                if (editMode)
+                {
+                    if (blinkState)
+                        lcdLines[1][pos] = ' ';
+                }
+                else
+                {
+                    if (blinkState)
+                        lcdLines[1][pos] = '_';
+                }
+            }
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_FORGET_PSU:
+        {
+            // Top line: "  Forget PSU   " with snake at position 15
+            snprintf(lcdLines[0], 16, "  Forget PSU   ");
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "[NO] YES" or "NO [YES]"
+            if (forgetSelection == FORGET_SEL_NO)
+                snprintf(lcdLines[1], 17, "    [NO]  YES   ");
+            else
+                snprintf(lcdLines[1], 17, "     NO  [YES]  ");
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_BACKLIGHT_SELECT:
+        {
+            // Top line: "   Backlight   " with snake at position 15
+            snprintf(lcdLines[0], 16, "   Backlight   ");
+            lcdLines[0][15] = 0; // Snake char
+
+            // Bottom line: "[Always] OnAlert" or " Always [OnAlrt]"
+            if (backlightSelection == BACKLIGHT_ALWAYS_ON)
+                snprintf(lcdLines[1], 17, "[Always] OnAlert");
+            else
+                snprintf(lcdLines[1], 17, " Always [OnAlrt]");
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
+
+        case MENU_MESSAGE_DISPLAY:
+        {
+            // Display message and check timeout
+            snprintf(lcdLines[0], 17, " NOT AVAILABLE  ");
+            snprintf(lcdLines[1], 17, " IN GROUP MODE  ");
+
+            if (millis() - messageStartTime >= MESSAGE_DISPLAY_MS)
+            {
+                currentScreen = returnScreen;
+            }
+
+            lcdCharIndex = 0;
+            lcdLoopState = LCD_STATE_SNAKE_CHECK;
+            break;
+        }
         }
         break;
 
@@ -1294,6 +1959,9 @@ void loop()
             int8_t delta = (newPosition > lastEncoderPosition) ? 1 : -1;
             lastEncoderPosition = newPosition;
 
+            // Track encoder activity for backlight timeout
+            lastEncoderActivityTime = now;
+
             if (currentScreen == MENU_HOMESCREEN)
             {
                 // Select PSU on homescreen
@@ -1303,9 +1971,129 @@ void loop()
             {
                 // Cycle through options menu items
                 int8_t newOption = (int8_t)selectedOption + delta;
-                if (newOption < 0) newOption = 3;
-                if (newOption > 3) newOption = 0;
+                if (newOption < 0) newOption = 4;
+                if (newOption > 4) newOption = 0;
                 selectedOption = (OptionsMenuItem)newOption;
+            }
+            else if (currentScreen == MENU_LOADSHARING_SELECT)
+            {
+                // Cycle through < ON OFF
+                int8_t newSel = (int8_t)lsSelection + delta;
+                if (newSel < 0) newSel = 2;
+                if (newSel > 2) newSel = 0;
+                lsSelection = (LoadSharingSelection)newSel;
+            }
+            else if (currentScreen == MENU_LOADSHARING_VGROUP)
+            {
+                if (editMode)
+                {
+                    // In edit mode: change the digit value
+                    editVoltage = setDigitInValue(editVoltage, editCursorPos, delta,
+                                                   PSU_VOLTAGE_MIN, PSU_VOLTAGE_MAX);
+                }
+                else
+                {
+                    // In cursor mode: move cursor (0-3 for digits, 4 for >)
+                    int8_t newPos = (int8_t)editCursorPos + delta;
+                    if (newPos < 0) newPos = 4;
+                    if (newPos > 4) newPos = 0;
+                    editCursorPos = newPos;
+                }
+            }
+            else if (currentScreen == MENU_LOADSHARING_CGROUP)
+            {
+                if (editMode)
+                {
+                    // In edit mode: change the digit value
+                    // For current, we have 5 digits (XXX.XX format, value 100-50000)
+                    uint16_t multiplier = 1;
+                    switch (editCursorPos)
+                    {
+                    case 0: multiplier = 10000; break;
+                    case 1: multiplier = 1000; break;
+                    case 2: multiplier = 100; break;
+                    case 3: multiplier = 10; break;
+                    case 4: multiplier = 1; break;
+                    }
+                    int32_t newVal = (int32_t)editCurrent + delta * multiplier;
+                    // Handle digit wrapping more precisely
+                    uint8_t currentDigit = (editCurrent / multiplier) % 10;
+                    int8_t newDigit = currentDigit + delta;
+                    if (newDigit > 9) newDigit = 0;
+                    if (newDigit < 0) newDigit = 9;
+                    newVal = editCurrent - (currentDigit * multiplier) + (newDigit * multiplier);
+                    if (newVal < GROUP_CURRENT_MIN) newVal = GROUP_CURRENT_MIN;
+                    if (newVal > GROUP_CURRENT_MAX) newVal = GROUP_CURRENT_MAX;
+                    editCurrent = (uint16_t)newVal;
+                }
+                else
+                {
+                    // In cursor mode: move cursor (0-4 for digits, 5 for >)
+                    int8_t newPos = (int8_t)editCursorPos + delta;
+                    if (newPos < 0) newPos = 5;
+                    if (newPos > 5) newPos = 0;
+                    editCursorPos = newPos;
+                }
+            }
+            else if (currentScreen == MENU_PARAMETERS_PSU_SELECT)
+            {
+                // Cycle through 0-9 and < (10 = back)
+                int8_t newSel = (int8_t)paramSelectedPsu + delta;
+                if (newSel < 0) newSel = 10;
+                if (newSel > 10) newSel = 0;
+                paramSelectedPsu = newSel;
+            }
+            else if (currentScreen == MENU_PARAMETERS_ONOFF)
+            {
+                // Cycle through < ON OFF
+                int8_t newSel = (int8_t)paramOnOff + delta;
+                if (newSel < 0) newSel = 2;
+                if (newSel > 2) newSel = 0;
+                paramOnOff = (ParamOnOffSelection)newSel;
+            }
+            else if (currentScreen == MENU_PARAMETERS_VSET)
+            {
+                if (editMode)
+                {
+                    // In edit mode: change the digit value
+                    editVoltage = setDigitInValue(editVoltage, editCursorPos, delta,
+                                                   PSU_VOLTAGE_MIN, PSU_VOLTAGE_MAX);
+                }
+                else
+                {
+                    // In cursor mode: move cursor (0-3 for digits, 4 for >)
+                    int8_t newPos = (int8_t)editCursorPos + delta;
+                    if (newPos < 0) newPos = 4;
+                    if (newPos > 4) newPos = 0;
+                    editCursorPos = newPos;
+                }
+            }
+            else if (currentScreen == MENU_PARAMETERS_CSET)
+            {
+                if (editMode)
+                {
+                    // In edit mode: change the digit value (individual PSU current: 100-5000)
+                    editCurrent = setDigitInValue(editCurrent, editCursorPos, delta,
+                                                   PSU_CURRENT_MIN, PSU_CURRENT_MAX);
+                }
+                else
+                {
+                    // In cursor mode: move cursor (0-3 for digits, 4 for >)
+                    int8_t newPos = (int8_t)editCursorPos + delta;
+                    if (newPos < 0) newPos = 4;
+                    if (newPos > 4) newPos = 0;
+                    editCursorPos = newPos;
+                }
+            }
+            else if (currentScreen == MENU_FORGET_PSU)
+            {
+                // Toggle between NO and YES
+                forgetSelection = (forgetSelection == FORGET_SEL_NO) ? FORGET_SEL_YES : FORGET_SEL_NO;
+            }
+            else if (currentScreen == MENU_BACKLIGHT_SELECT)
+            {
+                // Toggle between Always On and On Alert
+                backlightSelection = (backlightSelection == BACKLIGHT_ALWAYS_ON) ? BACKLIGHT_ON_ALERT : BACKLIGHT_ALWAYS_ON;
             }
         }
     }
@@ -1324,6 +2112,8 @@ void loop()
                 // Button just pressed - record start time
                 buttonPressStart = now;
                 longPressHandled = false;
+                // Track activity for backlight timeout
+                lastEncoderActivityTime = now;
             }
             else
             {
@@ -1345,7 +2135,254 @@ void loop()
                             currentScreen = MENU_HOMESCREEN;
                             selectedOption = OPTIONS_LOAD_SHARING; // Reset for next time
                         }
-                        // A, B, C do nothing for now
+                        else if (selectedOption == OPTIONS_LOAD_SHARING)
+                        {
+                            // Enter LoadSharing submenu
+                            currentScreen = MENU_LOADSHARING_SELECT;
+                            lsSelection = eepromConfig.groupMode ? LS_SEL_ON : LS_SEL_OFF;
+                        }
+                        else if (selectedOption == OPTIONS_PARAMETERS)
+                        {
+                            // Parameters only available when group mode is off
+                            if (eepromConfig.groupMode)
+                            {
+                                // Show "NOT AVAILABLE" message
+                                currentScreen = MENU_MESSAGE_DISPLAY;
+                                messageStartTime = millis();
+                                returnScreen = MENU_OPTIONS;
+                            }
+                            else
+                            {
+                                // Enter Parameters submenu
+                                currentScreen = MENU_PARAMETERS_PSU_SELECT;
+                                paramSelectedPsu = 0;
+                            }
+                        }
+                        else if (selectedOption == OPTIONS_FORGET_PSU)
+                        {
+                            // Enter Forget PSU submenu
+                            currentScreen = MENU_FORGET_PSU;
+                            forgetSelection = FORGET_SEL_NO;
+                        }
+                        else if (selectedOption == OPTIONS_BACKLIGHT)
+                        {
+                            // Enter Backlight mode submenu
+                            currentScreen = MENU_BACKLIGHT_SELECT;
+                            backlightSelection = eepromConfig.alwaysOnBacklight ? BACKLIGHT_ALWAYS_ON : BACKLIGHT_ON_ALERT;
+                        }
+                    }
+                    else if (currentScreen == MENU_LOADSHARING_SELECT)
+                    {
+                        if (lsSelection == LS_SEL_BACK)
+                        {
+                            // Go back to OPTIONS
+                            currentScreen = MENU_OPTIONS;
+                        }
+                        else if (lsSelection == LS_SEL_ON)
+                        {
+                            // Enter VGROUP editing
+                            currentScreen = MENU_LOADSHARING_VGROUP;
+                            editVoltage = eepromConfig.groupVoltage;
+                            editCurrent = eepromConfig.groupCurrent;
+                            editCursorPos = 0;
+                            editMode = false;
+                            blinkTimer = millis();
+                        }
+                        else // LS_SEL_OFF
+                        {
+                            // Disable load sharing: set minimum values for all PSUs, disable outputs
+                            debugPrintln("[MENU] Disabling load sharing...");
+                            eepromConfig.groupMode = false;
+                            for (int i = 0; i < 10; i++)
+                            {
+                                eepromConfig.psuData[i].setVoltage = PSU_VOLTAGE_MIN;
+                                eepromConfig.psuData[i].setCurrent = PSU_CURRENT_MIN;
+                                eepromConfig.psuData[i].outputEnabled = false;
+                            }
+                            eepromSave();
+                            softwareReset();
+                        }
+                    }
+                    else if (currentScreen == MENU_LOADSHARING_VGROUP)
+                    {
+                        if (editCursorPos == 4)
+                        {
+                            // > selected: go to CGROUP
+                            currentScreen = MENU_LOADSHARING_CGROUP;
+                            editCursorPos = 0;
+                            editMode = false;
+                            blinkTimer = millis();
+                        }
+                        else
+                        {
+                            // Toggle edit mode for current digit
+                            editMode = !editMode;
+                            blinkTimer = millis();
+                        }
+                    }
+                    else if (currentScreen == MENU_LOADSHARING_CGROUP)
+                    {
+                        if (editCursorPos == 5)
+                        {
+                            // > selected: save and reboot
+                            debugPrintln("[MENU] Saving load sharing settings...");
+                            eepromConfig.groupMode = true;
+                            eepromConfig.groupVoltage = editVoltage;
+                            eepromConfig.groupCurrent = editCurrent;
+                            // Enable all PSUs that were on the bus
+                            for (int i = 0; i < 10; i++)
+                            {
+                                if (eepromConfig.psuData[i].wasOnBus)
+                                {
+                                    eepromConfig.psuData[i].outputEnabled = true;
+                                }
+                            }
+                            eepromSave();
+                            softwareReset();
+                        }
+                        else
+                        {
+                            // Toggle edit mode for current digit
+                            editMode = !editMode;
+                            blinkTimer = millis();
+                        }
+                    }
+                    else if (currentScreen == MENU_PARAMETERS_PSU_SELECT)
+                    {
+                        if (paramSelectedPsu == 10)
+                        {
+                            // < selected: go back to OPTIONS
+                            currentScreen = MENU_OPTIONS;
+                        }
+                        else
+                        {
+                            // PSU selected: go to ON/OFF screen
+                            editingPsu = paramSelectedPsu;
+                            currentScreen = MENU_PARAMETERS_ONOFF;
+                            paramOnOff = psu[editingPsu].setOutputEnable ? PARAM_SEL_ON : PARAM_SEL_OFF;
+                        }
+                    }
+                    else if (currentScreen == MENU_PARAMETERS_ONOFF)
+                    {
+                        if (paramOnOff == PARAM_SEL_BACK)
+                        {
+                            // < selected: go back to PSU selection
+                            currentScreen = MENU_PARAMETERS_PSU_SELECT;
+                        }
+                        else if (paramOnOff == PARAM_SEL_OFF)
+                        {
+                            // OFF selected: disable output and save
+                            debugPrintln("[MENU] Disabling PSU output...");
+                            psu[editingPsu].setOutputEnable = false;
+                            eepromConfig.psuData[editingPsu].outputEnabled = false;
+                            eepromSave();
+                            // Go back to PSU selection
+                            currentScreen = MENU_PARAMETERS_PSU_SELECT;
+                        }
+                        else // PARAM_SEL_ON
+                        {
+                            // ON selected: enable output and go to VSET
+                            psu[editingPsu].setOutputEnable = true;
+                            eepromConfig.psuData[editingPsu].outputEnabled = true;
+                            // Load current values for editing
+                            editVoltage = eepromConfig.psuData[editingPsu].setVoltage;
+                            editCurrent = eepromConfig.psuData[editingPsu].setCurrent;
+                            editCursorPos = 0;
+                            editMode = false;
+                            blinkTimer = millis();
+                            currentScreen = MENU_PARAMETERS_VSET;
+                        }
+                    }
+                    else if (currentScreen == MENU_PARAMETERS_VSET)
+                    {
+                        if (editCursorPos == 4)
+                        {
+                            // > selected: go to CSET
+                            currentScreen = MENU_PARAMETERS_CSET;
+                            editCursorPos = 0;
+                            editMode = false;
+                            blinkTimer = millis();
+                        }
+                        else
+                        {
+                            // Toggle edit mode for current digit
+                            editMode = !editMode;
+                            blinkTimer = millis();
+                        }
+                    }
+                    else if (currentScreen == MENU_PARAMETERS_CSET)
+                    {
+                        if (editCursorPos == 4)
+                        {
+                            // > selected: save and apply (no reboot)
+                            char debugMsg[60];
+                            sprintf(debugMsg, "[MENU] Saving PSU%d: V=%d, C=%d",
+                                    editingPsu, editVoltage, editCurrent);
+                            debugPrintln(debugMsg);
+
+                            // Save to EEPROM
+                            eepromConfig.psuData[editingPsu].setVoltage = editVoltage;
+                            eepromConfig.psuData[editingPsu].setCurrent = editCurrent;
+                            eepromSave();
+
+                            // Apply to runtime
+                            psu[editingPsu].setVoltage = editVoltage;
+                            psu[editingPsu].setCurrent = editCurrent;
+
+                            // Go back to PSU selection
+                            currentScreen = MENU_PARAMETERS_PSU_SELECT;
+                        }
+                        else
+                        {
+                            // Toggle edit mode for current digit
+                            editMode = !editMode;
+                            blinkTimer = millis();
+                        }
+                    }
+                    else if (currentScreen == MENU_FORGET_PSU)
+                    {
+                        if (forgetSelection == FORGET_SEL_NO)
+                        {
+                            // NO selected: go back to OPTIONS
+                            currentScreen = MENU_OPTIONS;
+                        }
+                        else // FORGET_SEL_YES
+                        {
+                            // YES selected: forget all offline PSUs
+                            debugPrintln("[MENU] Forgetting offline PSUs...");
+                            for (int i = 0; i < 10; i++)
+                            {
+                                if (!psu[i].online && psu[i].wasOnBus)
+                                {
+                                    char debugMsg[40];
+                                    sprintf(debugMsg, "[MENU] Forgetting PSU%d", i);
+                                    debugPrintln(debugMsg);
+                                    psu[i].wasOnBus = false;
+                                    eepromConfig.psuData[i].wasOnBus = false;
+                                }
+                            }
+                            eepromSave();
+                            currentScreen = MENU_OPTIONS;
+                        }
+                    }
+                    else if (currentScreen == MENU_BACKLIGHT_SELECT)
+                    {
+                        // Save backlight selection
+                        bool newAlwaysOn = (backlightSelection == BACKLIGHT_ALWAYS_ON);
+                        if (eepromConfig.alwaysOnBacklight != newAlwaysOn)
+                        {
+                            eepromConfig.alwaysOnBacklight = newAlwaysOn;
+                            eepromSave();
+                            debugPrintln(newAlwaysOn ? "[MENU] Backlight: Always On" : "[MENU] Backlight: On Alert");
+                        }
+                        // Reset backlight state
+                        if (newAlwaysOn)
+                        {
+                            lcd.backlight();
+                            backlightCurrentlyOn = true;
+                        }
+                        lastEncoderActivityTime = now;
+                        currentScreen = MENU_OPTIONS;
                     }
                 }
             }
@@ -1368,6 +2405,72 @@ void loop()
                 currentScreen = MENU_OPTIONS;
                 selectedOption = OPTIONS_LOAD_SHARING;
             }
+        }
+    }
+
+    // Backlight control for "On Alert" mode
+    if (!eepromConfig.alwaysOnBacklight)
+    {
+        // Check for alert conditions: PSU online with AC lost, or offline with wasOnBus true
+        bool alertActive = false;
+        for (int i = 0; i < 10; i++)
+        {
+            if (psu[i].online && !psu[i].acPresent)
+            {
+                // PSU is online but AC is lost
+                alertActive = true;
+                break;
+            }
+            if (!psu[i].online && psu[i].wasOnBus)
+            {
+                // PSU went offline but was previously on bus
+                alertActive = true;
+                break;
+            }
+        }
+
+        // In settings menus, always keep backlight on
+        bool inSettingsMenu = (currentScreen != MENU_HOMESCREEN);
+
+        if (alertActive || inSettingsMenu)
+        {
+            // Keep backlight on during alert or in settings
+            if (!backlightCurrentlyOn)
+            {
+                lcd.backlight();
+                backlightCurrentlyOn = true;
+            }
+        }
+        else if (currentScreen == MENU_HOMESCREEN)
+        {
+            // On homescreen without alert: check timeout
+            if (now - lastEncoderActivityTime >= BACKLIGHT_TIMEOUT_MS)
+            {
+                // Timeout reached, turn off backlight
+                if (backlightCurrentlyOn)
+                {
+                    lcd.noBacklight();
+                    backlightCurrentlyOn = false;
+                }
+            }
+            else
+            {
+                // Within timeout, keep backlight on
+                if (!backlightCurrentlyOn)
+                {
+                    lcd.backlight();
+                    backlightCurrentlyOn = true;
+                }
+            }
+        }
+    }
+    else
+    {
+        // Always on mode: ensure backlight is on
+        if (!backlightCurrentlyOn)
+        {
+            lcd.backlight();
+            backlightCurrentlyOn = true;
         }
     }
 }
