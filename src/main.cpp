@@ -1115,6 +1115,16 @@ enum HomescreenBottomLineMode
 };
 HomescreenBottomLineMode bottomLineMode = HOMESCREEN_VALUES_VOLTAGES;
 
+// Total (T) bottom line modes - when selectedPsu == 10
+enum TotalBottomLineMode
+{
+    TOTAL_VALUES_POUT,    // POUT: sum of output power (V*A)
+    TOTAL_VALUES_COUT,    // COUT: sum of output current
+    TOTAL_VALUES_PIN,     // PIN:  sum of input power
+    TOTAL_VALUES_TMAX     // TMAX: highest temperature
+};
+TotalBottomLineMode totalBottomLineMode = TOTAL_VALUES_POUT;
+
 // Options menu items
 enum OptionsMenuItem
 {
@@ -1255,6 +1265,18 @@ const uint8_t invertedDigits[10][8] PROGMEM = {
     {0b11111, 0b10001, 0b11101, 0b11101, 0b11011, 0b11011, 0b11111, 0b11111}, // 7
     {0b11111, 0b10001, 0b10101, 0b10001, 0b10101, 0b10001, 0b11111, 0b11111}, // 8
     {0b11111, 0b10001, 0b10101, 0b10001, 0b11101, 0b10001, 0b11111, 0b11111}  // 9
+};
+
+// Inverted T for "Total" selection (char 1 when T is selected)
+const uint8_t invertedT[8] PROGMEM = {
+    0b11111,
+    0b10001,
+    0b11011,
+    0b11011,
+    0b11011,
+    0b11011,
+    0b11111,
+    0b11111
 };
 
 // Custom characters for bottom line labels (main letter + subscript)
@@ -1425,16 +1447,16 @@ void lcd_loop()
                 {
                     if (encoderPosition > lastEncoderForMenu)
                     {
-                        selectedPsu = (selectedPsu + 1) % 10;
+                        selectedPsu = (selectedPsu + 1) % 11; // 0-9 for PSUs, 10 for Total
                     }
                     else
                     {
-                        selectedPsu = (selectedPsu + 9) % 10; // Wrap around backwards
+                        selectedPsu = (selectedPsu + 10) % 11; // Wrap around backwards
                     }
                     lastEncoderForMenu = encoderPosition;
                 }
 
-                // Build PSU row: positions 0-9 show PSU status
+                // Build PSU row: positions 0-9 show PSU status, position 10 shows T (Total)
                 activePsus = '0';
                 for (int i = 0; i < 10; i++)
                 {
@@ -1457,10 +1479,13 @@ void lcd_loop()
                     }
                 }
                 // Count selected PSU if online (wasn't counted in loop above)
-                if (psu[selectedPsu].online)
+                if (selectedPsu < 10 && psu[selectedPsu].online)
                 {
                     activePsus++;
                 }
+
+                // Position 10: T (Total) - show inverted T when selected
+                lcdLines[0][10] = (selectedPsu == 10) ? 1 : 'T';
 
                 // Update warning blink state
                 uint32_t currentTime = millis();
@@ -1506,19 +1531,16 @@ void lcd_loop()
                     }
                 }
 
-                // Positions 10-14: spaces or warnings, 15: snake
-                lcdLines[0][10] = ' ';
-                lcdLines[0][11] = ' ';
-                // Position 12: VSET error warning (char 5)
-                lcdLines[0][12] = (vsetWarning && warningBlinkState) ? 5 : ' ';
-                // Position 13: AC lost warning (char 4)
-                lcdLines[0][13] = (acLostWarning && warningBlinkState) ? 4 : ' ';
-                // Position 14: Group warning (char 7), Offline warning (char 6), or PSU count
-                // Priority: groupTooFewPsus > offlineWarning > activePsus count
+                // Positions 11-14: warnings and count, 15: snake
+                // Position 11: VSET error warning (char 5)
+                lcdLines[0][11] = (vsetWarning && warningBlinkState) ? 5 : ' ';
+                // Position 12: AC lost warning (char 4)
+                lcdLines[0][12] = (acLostWarning && warningBlinkState) ? 4 : ' ';
+                // Position 13: Offline warning (char 6)
+                lcdLines[0][13] = (offlineWarning && warningBlinkState) ? 6 : ' ';
+                // Position 14: Group warning (char 7) or PSU count
                 if (groupTooFewPsus && warningBlinkState)
                     lcdLines[0][14] = 7; // Too few PSUs warning
-                else if (offlineWarning && warningBlinkState)
-                    lcdLines[0][14] = 6; // Offline warning
                 else
                     lcdLines[0][14] = activePsus;
                 lcdLines[0][15] = 0; // Custom char 0 (snake)
@@ -1528,10 +1550,13 @@ void lcd_loop()
             }
 
             case HOMESCREEN_FORMAT_ACTIVE_PSUS:
-                // Load inverted digit pattern for selected PSU into custom char 1
+                // Load inverted character pattern for selected item into custom char 1
                 for (int i = 0; i < 8; i++)
                 {
-                    invertedCharData[i] = pgm_read_byte(&invertedDigits[selectedPsu][i]);
+                    if (selectedPsu == 10)
+                        invertedCharData[i] = pgm_read_byte(&invertedT[i]);
+                    else
+                        invertedCharData[i] = pgm_read_byte(&invertedDigits[selectedPsu][i]);
                 }
                 invertedCharRowIndex = 0;
                 homescreenState = HOMESCREEN_FORMAT_WRITE_CHAR;
@@ -1577,6 +1602,65 @@ void lcd_loop()
 
             case HOMESCREEN_FORMAT_BOTTOM_LINE:
             {
+                // Handle Total (T) mode separately
+                if (selectedPsu == 10)
+                {
+                    // Calculate totals for online PSUs with output enabled
+                    uint32_t totalPowerOut = 0;  // Sum of V*A in centiWatts
+                    uint32_t totalCurrentOut = 0; // Sum of current in centiAmps
+                    uint32_t totalPowerIn = 0;   // Sum of input power in Watts
+                    uint16_t maxTemp = 0;        // Max temperature
+                    bool foundOnlinePsu = false;
+
+                    for (int i = 0; i < 10; i++)
+                    {
+                        if (psu[i].online)
+                        {
+                            foundOnlinePsu = true;
+                            // Update max temperature for all online PSUs
+                            if (psu[i].inputTemperature > maxTemp)
+                                maxTemp = psu[i].inputTemperature;
+                            if (psu[i].outputTemperature > maxTemp)
+                                maxTemp = psu[i].outputTemperature;
+
+                            if (psu[i].isOutputEnable)
+                            {
+                                // actVoltage is in centiVolts, actCurrent in centiAmps
+                                // Power = V * A = (cV/100) * (cA/100) = cV*cA/10000 Watts
+                                totalPowerOut += ((uint32_t)psu[i].actVoltage * psu[i].actCurrent) / 10000;
+                                totalCurrentOut += psu[i].actCurrent;
+                                totalPowerIn += psu[i].inputPowerW;
+                            }
+                        }
+                    }
+
+                    switch (totalBottomLineMode)
+                    {
+                    case TOTAL_VALUES_POUT:
+                        snprintf(lcdLines[1], 17, "POUT:%7luW   ", totalPowerOut);
+                        break;
+                    case TOTAL_VALUES_COUT:
+                        snprintf(lcdLines[1], 17, "COUT:%4lu.%02luA   ",
+                                 totalCurrentOut / 100, totalCurrentOut % 100);
+                        break;
+                    case TOTAL_VALUES_PIN:
+                        snprintf(lcdLines[1], 17, "PIN: %7luW   ", totalPowerIn);
+                        break;
+                    case TOTAL_VALUES_TMAX:
+                        if (!foundOnlinePsu)
+                            snprintf(lcdLines[1], 17, "TMAX:  --\337C     ");
+                        else
+                            snprintf(lcdLines[1], 17, "TMAX:%4d.%d\337C   ",
+                                     maxTemp / 100, (maxTemp % 100) / 10);
+                        break;
+                    }
+
+                    lcdCharIndex = 0;
+                    homescreenState = HOMESCREEN_FORMAT_PSU_ROW;
+                    lcdLoopState = LCD_STATE_SNAKE_CHECK;
+                    break;
+                }
+
                 // Write custom chars 2 and 3 for bottom line icons
                 const uint8_t *char2Src;
                 const uint8_t *char3Src;
@@ -2382,9 +2466,20 @@ void loop()
                     if (currentScreen == MENU_HOMESCREEN)
                     {
                         // Short press on homescreen: cycle through bottom line modes
-                        bottomLineMode = static_cast<HomescreenBottomLineMode>(
-                            (bottomLineMode + 1) % 4
-                        );
+                        if (selectedPsu == 10)
+                        {
+                            // Cycle through Total modes (POUT, COUT, PIN, TMAX)
+                            totalBottomLineMode = static_cast<TotalBottomLineMode>(
+                                (totalBottomLineMode + 1) % 4
+                            );
+                        }
+                        else
+                        {
+                            // Cycle through normal PSU modes
+                            bottomLineMode = static_cast<HomescreenBottomLineMode>(
+                                (bottomLineMode + 1) % 4
+                            );
+                        }
                     }
                     else if (currentScreen == MENU_OPTIONS)
                     {
