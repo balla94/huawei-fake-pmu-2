@@ -347,7 +347,12 @@ void eepromSetWasOnBus(uint8_t psuIndex)
 void softwareReset()
 {
     debugPrintln("[SYSTEM] Rebooting...");
-    delay(100); // Allow debug message to be sent
+
+    // Put LCD in known state before reset
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Rebooting...");
+    delay(200); // Allow LCD to update and debug message to be sent
 
     // Use watchdog timer for reset
     _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8CLK_gc); // Shortest timeout
@@ -471,12 +476,25 @@ uint8_t calculateCRC(const uint8_t *buffer, uint8_t length)
 
 void setup()
 {
+    // Wait for power to stabilize and LCD to be ready
+    // HD44780 needs at least 40ms after Vcc rises to 4.5V
     delay(100);
 
-    lcd.init();
+    // Set I2C clock BEFORE initializing LCD
+    Wire.begin();
     Wire.setClock(I2C_FREQ);
+
+    // Initialize LCD with proper sequence
+    delay(50);  // Extra delay for LCD power-on
+    lcd.init();
+    delay(10);  // Wait after init
+    lcd.init(); // Double init for reliability after watchdog reset
+    delay(10);
+
     lcd.backlight();
+    delay(5);
     lcd.clear();
+    delay(5);
     lcd.setCursor(0, 0);
     lcd.print("Initializing");
 
@@ -1348,6 +1366,23 @@ const uint8_t charOffline[8] PROGMEM = {
     0b00100
 };
 
+// Warning: Too few PSUs (char 7) - "Lo" symbol (not enough PSUs for group current)
+const uint8_t charTooFewPsus[8] PROGMEM = {
+    0b10000,
+    0b10001,
+    0b11101,
+    0b00001,
+    0b11101,
+    0b10100,
+    0b10101,
+    0b11100
+};
+
+// Group mode state
+bool groupTooFewPsus = false;      // True when not enough PSUs to distribute current
+uint32_t lastGroupLoopTime = 0;
+#define GROUP_LOOP_INTERVAL_MS 100
+
 // Warning blink control
 #define WARNING_BLINK_MS 500
 uint32_t lastWarningBlink = 0;
@@ -1478,8 +1513,14 @@ void lcd_loop()
                 lcdLines[0][12] = (vsetWarning && warningBlinkState) ? 5 : ' ';
                 // Position 13: AC lost warning (char 4)
                 lcdLines[0][13] = (acLostWarning && warningBlinkState) ? 4 : ' ';
-                // Position 14: Offline warning (char 6) or active PSU count
-                lcdLines[0][14] = (offlineWarning && warningBlinkState) ? 6 : activePsus;
+                // Position 14: Group warning (char 7), Offline warning (char 6), or PSU count
+                // Priority: groupTooFewPsus > offlineWarning > activePsus count
+                if (groupTooFewPsus && warningBlinkState)
+                    lcdLines[0][14] = 7; // Too few PSUs warning
+                else if (offlineWarning && warningBlinkState)
+                    lcdLines[0][14] = 6; // Offline warning
+                else
+                    lcdLines[0][14] = activePsus;
                 lcdLines[0][15] = 0; // Custom char 0 (snake)
 
                 homescreenState = HOMESCREEN_FORMAT_ACTIVE_PSUS;
@@ -1524,6 +1565,11 @@ void lcd_loop()
                 lcd.command(0x70);
                 for (int i = 0; i < 8; i++)
                     lcd.write(pgm_read_byte(&charOffline[i]));
+
+                // Char 7 at CGRAM address 0x78 (too few PSUs warning)
+                lcd.command(0x78);
+                for (int i = 0; i < 8; i++)
+                    lcd.write(pgm_read_byte(&charTooFewPsus[i]));
 
                 homescreenState = HOMESCREEN_FORMAT_BOTTOM_LINE;
                 break;
@@ -2053,9 +2099,111 @@ void lcd_loop()
     }
 }
 
+// =============================================================================
+// GROUP MODE LOGIC
+// =============================================================================
+// Distributes current equally among online PSUs when in group mode
+// Runs every 100ms and modifies PSU struct in real time
+
+void group_loop()
+{
+    // Only run in group mode
+    if (!eepromConfig.groupMode)
+    {
+        groupTooFewPsus = false;
+        return;
+    }
+
+    // Check if it's time to run (100ms interval)
+    uint32_t now = millis();
+    if (now - lastGroupLoopTime < GROUP_LOOP_INTERVAL_MS)
+        return;
+    lastGroupLoopTime = now;
+
+    // Count online PSUs
+    uint8_t onlineCount = 0;
+    for (int i = 0; i < 10; i++)
+    {
+        if (psu[i].online)
+            onlineCount++;
+    }
+
+    // If no PSUs online, nothing to do
+    if (onlineCount == 0)
+    {
+        groupTooFewPsus = false;
+        return;
+    }
+
+    // Calculate current per PSU
+    uint16_t targetCurrent = eepromConfig.groupCurrent;
+    uint16_t currentPerPsu = targetCurrent / onlineCount;
+
+    // Case 1: Too few PSUs - current per PSU exceeds max
+    if (currentPerPsu > PSU_CURRENT_MAX)
+    {
+        groupTooFewPsus = true;
+        // Set all online PSUs to maximum current
+        for (int i = 0; i < 10; i++)
+        {
+            if (psu[i].online)
+            {
+                psu[i].setCurrent = PSU_CURRENT_MAX;
+            }
+        }
+        return;
+    }
+
+    // Case 2: Too many PSUs - current per PSU below minimum
+    if (currentPerPsu < PSU_CURRENT_MIN)
+    {
+        groupTooFewPsus = false;
+        // Calculate how many PSUs we actually need
+        // N PSUs where targetCurrent / N >= PSU_CURRENT_MIN
+        // N <= targetCurrent / PSU_CURRENT_MIN
+        uint8_t neededPsus = targetCurrent / PSU_CURRENT_MIN;
+        if (neededPsus == 0)
+            neededPsus = 1; // At least one PSU
+
+        // Shut down excess PSUs (keep first N online PSUs)
+        uint8_t keptCount = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            if (psu[i].online)
+            {
+                if (keptCount < neededPsus)
+                {
+                    // Keep this PSU, set its current
+                    psu[i].setCurrent = targetCurrent / neededPsus;
+                    psu[i].setOutputEnable = true;
+                    keptCount++;
+                }
+                else
+                {
+                    // Shut down this PSU
+                    psu[i].setOutputEnable = false;
+                }
+            }
+        }
+        return;
+    }
+
+    // Case 3: Normal distribution - current is within valid range
+    groupTooFewPsus = false;
+    for (int i = 0; i < 10; i++)
+    {
+        if (psu[i].online)
+        {
+            psu[i].setCurrent = currentPerPsu;
+            psu[i].setOutputEnable = true;
+        }
+    }
+}
+
 void loop()
 {
     psu_loop();
+    group_loop();
     lcd_loop();
     uint32_t now = millis();
 
@@ -2335,8 +2483,9 @@ void loop()
                     {
                         if (editCursorPos == 5)
                         {
-                            // > selected: save and reboot
+                            // > selected: save settings
                             debugPrintln("[MENU] Saving load sharing settings...");
+                            bool wasAlreadyInGroupMode = eepromConfig.groupMode;
                             eepromConfig.groupMode = true;
                             eepromConfig.groupVoltage = editVoltage;
                             eepromConfig.groupCurrent = editCurrent;
@@ -2349,7 +2498,19 @@ void loop()
                                 }
                             }
                             eepromSave();
-                            softwareReset();
+
+                            if (wasAlreadyInGroupMode)
+                            {
+                                // Already in group mode - just return to homescreen
+                                // group_loop() will pick up the new values
+                                debugPrintln("[MENU] Updated group settings (no reboot)");
+                                currentScreen = MENU_HOMESCREEN;
+                            }
+                            else
+                            {
+                                // Entering group mode - reboot required
+                                softwareReset();
+                            }
                         }
                         else
                         {
