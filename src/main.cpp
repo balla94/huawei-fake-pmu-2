@@ -2778,8 +2778,14 @@ void loop()
     // Backlight control for "On Alert" mode
     if (!eepromConfig.alwaysOnBacklight)
     {
-        // Check for alert conditions: PSU online with AC lost, or offline with wasOnBus true
+        // Check for alert conditions
         bool alertActive = false;
+
+        // Alert: Not enough PSUs to meet group current demand
+        if (groupTooFewPsus)
+            alertActive = true;
+
+        // Alert: PSU online with AC lost, or offline with wasOnBus true
         for (int i = 0; i < 10; i++)
         {
             if (psu[i].online && !psu[i].acPresent)
