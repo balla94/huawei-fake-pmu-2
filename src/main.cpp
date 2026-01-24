@@ -584,12 +584,12 @@ void processAnswer(uint8_t psu_id, const uint8_t *buffer, uint8_t length)
     {
         if (buffer[7] == 0x00)
         {
-            psu[psu_id].setVoltageError = true;
+            psu[psu_id].setVoltageError = false;
             debugPrintln("VSET OK");
         }
         else
         {
-            psu[psu_id].setVoltageError = false;
+            psu[psu_id].setVoltageError = true;
             debugPrintln("VSET Error");
         }
         break;
@@ -1082,6 +1082,7 @@ enum HomescreenState
     HOMESCREEN_FORMAT_PSU_ROW,
     HOMESCREEN_FORMAT_ACTIVE_PSUS,
     HOMESCREEN_FORMAT_WRITE_CHAR,
+    HOMESCREEN_FORMAT_WARNING_CHARS,
     HOMESCREEN_FORMAT_BOTTOM_LINE
 };
 HomescreenState homescreenState = HOMESCREEN_FORMAT_PSU_ROW;
@@ -1311,6 +1312,47 @@ const uint8_t charTo[8] PROGMEM = {
     0b01110
 };
 
+// Warning: AC Lost (char 4) - "E!" symbol
+const uint8_t charAcLost[8] PROGMEM = {
+    0b11111,
+    0b10000,
+    0b11110,
+    0b10000,
+    0b10000,
+    0b00000,
+    0b10111,
+    0b10101
+};
+
+// Warning: VSET Error (char 5) - "VE" symbol
+const uint8_t charVsetError[8] PROGMEM = {
+    0b10101,
+    0b10101,
+    0b10010,
+    0b10000,
+    0b10111,
+    0b10101,
+    0b00111,
+    0b10101
+};
+
+// Warning: Offline (char 6) - "Of" symbol (PSU offline but was on bus)
+const uint8_t charOffline[8] PROGMEM = {
+    0b11100,
+    0b10000,
+    0b11000,
+    0b10000,
+    0b10111,
+    0b00101,
+    0b00111,
+    0b00100
+};
+
+// Warning blink control
+#define WARNING_BLINK_MS 500
+uint32_t lastWarningBlink = 0;
+bool warningBlinkState = true;
+
 uint8_t snakeFrame = 0;
 uint8_t snakeRowIndex = 0;
 uint8_t snakeCharData[8];
@@ -1385,12 +1427,59 @@ void lcd_loop()
                     activePsus++;
                 }
 
-                // Positions 10-13: spaces, 14: count, 15: snake
+                // Update warning blink state
+                uint32_t currentTime = millis();
+                if (currentTime - lastWarningBlink >= WARNING_BLINK_MS)
+                {
+                    lastWarningBlink = currentTime;
+                    warningBlinkState = !warningBlinkState;
+                }
+
+                // Check for VSET error warning (position 12)
+                // Active if any online PSU has setVoltageError AND isOutputEnable
+                bool vsetWarning = false;
+                for (int i = 0; i < 10; i++)
+                {
+                    if (psu[i].online && psu[i].setVoltageError && psu[i].setOutputEnable)
+                    {
+                        vsetWarning = true;
+                        break;
+                    }
+                }
+
+                // Check for AC lost warning (position 13)
+                // Active if any online PSU has acPresent=false
+                bool acLostWarning = false;
+                for (int i = 0; i < 10; i++)
+                {
+                    if (psu[i].online && !psu[i].acPresent)
+                    {
+                        acLostWarning = true;
+                        break;
+                    }
+                }
+
+                // Check for offline warning (position 14)
+                // Active if any PSU is offline but wasOnBus=true
+                bool offlineWarning = false;
+                for (int i = 0; i < 10; i++)
+                {
+                    if (!psu[i].online && psu[i].wasOnBus)
+                    {
+                        offlineWarning = true;
+                        break;
+                    }
+                }
+
+                // Positions 10-14: spaces or warnings, 15: snake
                 lcdLines[0][10] = ' ';
                 lcdLines[0][11] = ' ';
-                lcdLines[0][12] = ' ';
-                lcdLines[0][13] = ' ';
-                lcdLines[0][14] = activePsus;
+                // Position 12: VSET error warning (char 5)
+                lcdLines[0][12] = (vsetWarning && warningBlinkState) ? 5 : ' ';
+                // Position 13: AC lost warning (char 4)
+                lcdLines[0][13] = (acLostWarning && warningBlinkState) ? 4 : ' ';
+                // Position 14: Offline warning (char 6) or active PSU count
+                lcdLines[0][14] = (offlineWarning && warningBlinkState) ? 6 : activePsus;
                 lcdLines[0][15] = 0; // Custom char 0 (snake)
 
                 homescreenState = HOMESCREEN_FORMAT_ACTIVE_PSUS;
@@ -1414,9 +1503,31 @@ void lcd_loop()
                 invertedCharRowIndex++;
                 if (invertedCharRowIndex >= 8)
                 {
-                    homescreenState = HOMESCREEN_FORMAT_BOTTOM_LINE;
+                    homescreenState = HOMESCREEN_FORMAT_WARNING_CHARS;
                 }
                 break;
+
+            case HOMESCREEN_FORMAT_WARNING_CHARS:
+            {
+                // Write warning characters to CGRAM (char 4 = AC lost, char 5 = VSET error, char 6 = offline)
+                // Char 4 at CGRAM address 0x60
+                lcd.command(0x60);
+                for (int i = 0; i < 8; i++)
+                    lcd.write(pgm_read_byte(&charAcLost[i]));
+
+                // Char 5 at CGRAM address 0x68
+                lcd.command(0x68);
+                for (int i = 0; i < 8; i++)
+                    lcd.write(pgm_read_byte(&charVsetError[i]));
+
+                // Char 6 at CGRAM address 0x70
+                lcd.command(0x70);
+                for (int i = 0; i < 8; i++)
+                    lcd.write(pgm_read_byte(&charOffline[i]));
+
+                homescreenState = HOMESCREEN_FORMAT_BOTTOM_LINE;
+                break;
+            }
 
             case HOMESCREEN_FORMAT_BOTTOM_LINE:
             {
