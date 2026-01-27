@@ -1306,26 +1306,26 @@ const uint8_t charVo[8] PROGMEM = {
 
 // Ci = Current In
 const uint8_t charCi[8] PROGMEM = {
-    0b01111,
-    0b10000,
-    0b10000,
-    0b01111,
-    0b00000,
-    0b10111,
-    0b10101,
-    0b10101
+  0b01110,
+  0b00100,
+  0b00100,
+  0b01110,
+  0b00000,
+  0b10111,
+  0b10101,
+  0b10101
 };
 
 // Co = Current Out
 const uint8_t charCo[8] PROGMEM = {
-    0b01111,
-    0b10000,
-    0b10000,
-    0b01111,
-    0b00000,
-    0b01110,
-    0b01010,
-    0b01110
+  0b01110,
+  0b00100,
+  0b00100,
+  0b01110,
+  0b00000,
+  0b01110,
+  0b01010,
+  0b01110
 };
 
 // Ti = Temperature In
@@ -1640,7 +1640,7 @@ void lcd_loop()
                         snprintf(lcdLines[1], 17, "POUT:%7luW   ", totalPowerOut);
                         break;
                     case TOTAL_VALUES_COUT:
-                        snprintf(lcdLines[1], 17, "COUT:%4lu.%02luA   ",
+                        snprintf(lcdLines[1], 17, "IOUT:%4lu.%02luA   ",
                                  totalCurrentOut / 100, totalCurrentOut % 100);
                         break;
                     case TOTAL_VALUES_PIN:
@@ -1733,7 +1733,7 @@ void lcd_loop()
                         break;
 
                     case HOMESCREEN_VALUES_OUTPUT:
-                        if (!psu[selectedPsu].isOutputEnable)
+                        if (!psu[selectedPsu].setOutputEnable)
                         {
                             snprintf(lcdLines[1], 17, "PSU STANDBY     ");
                         }
